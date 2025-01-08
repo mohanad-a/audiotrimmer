@@ -1,0 +1,38 @@
+# This file lists the Python package dependencies for the Audio Intro Remover.
+# Use with Python 3.7+ in a virtual environment:
+#
+# python3 -m venv venv
+# source venv/bin/activate  # or .\venv\Scripts\activate on Windows
+# pip install --upgrade pip
+# pip install -r requirements.txt
+
+# Core dependencies (required)
+ffmpeg-python>=0.2.0
+tqdm>=4.65.0
+
+# Audio processing dependencies (required for template matching)
+librosa>=0.10.1       # For audio analysis and fingerprinting
+scipy>=1.11.0         # For signal processing
+numpy>=1.24.0         # Required by librosa and scipy
+
+# Optional dependencies for advanced features
+pydub>=0.25.1         # For smart trimming and silence detection
+sounddevice>=0.4.6    # For audio preview
+soundfile>=0.12.1     # For audio preview and audio loading
+
+# GUI Support (tkinter)
+# DO NOT install tkinter via pip! Instead:
+# 1. Deactivate your virtual environment: deactivate
+# 2. Install system-level tkinter:
+#    macOS:
+#       brew uninstall --ignore-dependencies python@3.12
+#       brew install python-tk@3.12
+#       # or for all Python versions:
+#       brew install python-tk
+#    Ubuntu:   sudo apt-get install python3-tk
+#    Fedora:   sudo dnf install python3-tkinter
+#    Windows:  Reinstall Python with tcl/tk option checked
+# 3. Recreate your virtual environment:
+#    python3 -m venv venv
+#    source venv/bin/activate  # or .\venv\Scripts\activate on Windows
+#    pip install -r requirements.txt 
