@@ -9,9 +9,15 @@ from typing import Dict, Tuple, Optional, List, Callable
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+import multiprocessing
 
 from ..utils.loaders import load_audio_modules, load_audio_processing_modules
 from ..utils.constants import SUPPORTED_FORMATS, SUPPORTED_CODECS
+
+# Determine optimal number of workers based on CPU cores
+DEFAULT_MAX_WORKERS = max(
+    1, min(multiprocessing.cpu_count() - 1, 4)
+)  # Leave 1 core free, max 4 workers
 
 
 def get_relative_path(file_path: str, input_folder: str) -> str:
@@ -44,9 +50,11 @@ def save_processed_files(tracking_file: str, processed_files: set) -> None:
     try:
         # Ensure directory exists
         os.makedirs(os.path.dirname(tracking_file), exist_ok=True)
+        # Convert any Path objects to strings before serialization
+        processed_files_str = {str(path) for path in processed_files}
         with open(tracking_file, "w") as f:
             # Sort the files for better readability
-            json.dump(sorted(list(processed_files)), f, indent=2)
+            json.dump(sorted(list(processed_files_str)), f, indent=2)
     except Exception as e:
         logging.error(f"Error saving tracking file: {e}")
 
@@ -288,11 +296,19 @@ def compute_audio_fingerprint(audio_path: str, sr: int = 22050) -> np.ndarray:
     if not librosa:
         raise ImportError("Required module not found. Please install librosa")
 
-    # Load audio with a fixed duration if it's an intro template
-    y, sr = librosa.load(audio_path, sr=sr)
+    # Load audio with optimized parameters
+    y, sr = librosa.load(
+        audio_path, sr=sr, duration=30
+    )  # Only load first 30 seconds for fingerprint
 
-    # Compute mel spectrogram
-    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr)
+    # Compute mel spectrogram with optimized parameters
+    mel_spec = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_mels=64,  # Reduced number of mel bands
+        n_fft=1024,  # Smaller FFT window
+        hop_length=512,
+    )
 
     # Convert to log scale
     mel_db = librosa.power_to_db(mel_spec, ref=np.max)
@@ -419,6 +435,10 @@ def remove_audio_duration(
 
     total_files = len(audio_files)
     processed_files = 0
+
+    # Use optimized number of workers if not specified
+    if max_workers is None:
+        max_workers = DEFAULT_MAX_WORKERS
 
     # Process files with progress bar
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
