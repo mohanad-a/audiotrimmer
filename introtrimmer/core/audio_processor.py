@@ -9,31 +9,52 @@ from typing import Dict, Tuple, Optional, List, Callable
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-import multiprocessing
 
 from ..utils.loaders import load_audio_modules, load_audio_processing_modules
 from ..utils.constants import SUPPORTED_FORMATS, SUPPORTED_CODECS
-
-# Determine optimal number of workers based on CPU cores
-DEFAULT_MAX_WORKERS = max(
-    1, min(multiprocessing.cpu_count() - 1, 4)
-)  # Leave 1 core free, max 4 workers
 
 
 def get_relative_path(file_path: str, input_folder: str) -> str:
     """Get path relative to input folder."""
     try:
-        return str(Path(file_path).relative_to(Path(input_folder)))
-    except ValueError:
-        return str(Path(file_path))
+        file_path = Path(file_path).resolve()
+        input_folder = Path(input_folder).resolve()
+        try:
+            rel_path = file_path.relative_to(input_folder)
+            # Convert to string with forward slashes for consistency
+            return str(rel_path).replace(os.sep, "/")
+        except ValueError:
+            # If we can't get relative path, return the filename
+            return file_path.name
+    except Exception:
+        # In case of any other error, return the filename
+        return Path(file_path).name
 
 
 def load_processed_files(tracking_file: str) -> set:
     """Load the set of previously processed files."""
+    if not tracking_file:
+        return set()
+
     try:
         if os.path.exists(tracking_file):
+            if os.path.getsize(tracking_file) == 0:
+                # File exists but is empty, initialize it
+                with open(tracking_file, "w") as f:
+                    json.dump([], f, indent=2)
+                return set()
+
             with open(tracking_file, "r") as f:
-                return set(json.load(f))
+                try:
+                    return set(json.load(f))
+                except json.JSONDecodeError:
+                    # If file is corrupted, backup and start fresh
+                    if os.path.exists(tracking_file + ".bak"):
+                        os.remove(tracking_file + ".bak")
+                    os.rename(tracking_file, tracking_file + ".bak")
+                    with open(tracking_file, "w") as f:
+                        json.dump([], f, indent=2)
+                    return set()
         else:
             # Create the tracking file with an empty list if it doesn't exist
             os.makedirs(os.path.dirname(tracking_file), exist_ok=True)
@@ -41,22 +62,42 @@ def load_processed_files(tracking_file: str) -> set:
                 json.dump([], f, indent=2)
             return set()
     except Exception as e:
-        logging.warning(f"Error loading tracking file: {e}")
-    return set()
+        logging.warning(f"Error accessing tracking file: {e}")
+        return set()
 
 
 def save_processed_files(tracking_file: str, processed_files: set) -> None:
     """Save the set of processed files."""
+    if not tracking_file:
+        return
+
     try:
         # Ensure directory exists
         os.makedirs(os.path.dirname(tracking_file), exist_ok=True)
-        # Convert any Path objects to strings before serialization
-        processed_files_str = {str(path) for path in processed_files}
-        with open(tracking_file, "w") as f:
-            # Sort the files for better readability
-            json.dump(sorted(list(processed_files_str)), f, indent=2)
+
+        # Create a temporary file for atomic write
+        temp_file = tracking_file + ".tmp"
+        # Convert all paths to strings before saving
+        processed_list = sorted([str(path) for path in processed_files])
+
+        with open(temp_file, "w") as f:
+            json.dump(processed_list, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())  # Ensure data is written to disk
+
+        # Atomic rename for safer file writing
+        if os.path.exists(tracking_file):
+            os.replace(temp_file, tracking_file)
+        else:
+            os.rename(temp_file, tracking_file)
+
     except Exception as e:
         logging.error(f"Error saving tracking file: {e}")
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
 
 
 def process_file(file_info: tuple) -> bool:
@@ -79,23 +120,24 @@ def process_file(file_info: tuple) -> bool:
         input_folder,
     ) = file_info
 
-    input_path = Path(input_path)
-    rel_path = get_relative_path(str(input_path), input_folder)
-    filename = input_path.name
-    logger = logging.getLogger("audio_trimmer")
+    try:
+        input_path = Path(input_path).resolve()
+        input_folder = Path(input_folder).resolve()
+        tracking_rel_path = get_relative_path(str(input_path), str(input_folder))
+        filename = tracking_rel_path  # Use relative path for logging
+        logger = logging.getLogger("audio_trimmer")
 
-    # Check if file was already processed using relative path
-    if not force_process and tracking_file:
-        processed_files = load_processed_files(tracking_file)
-        if rel_path in processed_files:
-            logger.info(f"Skipping already processed file: {rel_path}")
+        # Check if file was already processed using relative path
+        if not force_process and tracking_file:
+            processed_files = load_processed_files(tracking_file)
+            if tracking_rel_path in processed_files:
+                logger.info(f"Skipping already processed file: {tracking_rel_path}")
+                return True
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would process: {tracking_rel_path}")
             return True
 
-    if dry_run:
-        logger.info(f"[DRY RUN] Would process: {rel_path}")
-        return True
-
-    try:
         # Determine output path with possible format conversion
         output_ext = output_format or input_path.suffix
         output_filename = input_path.stem + output_ext
@@ -103,18 +145,11 @@ def process_file(file_info: tuple) -> bool:
         # Create output directory if it doesn't exist
         if output_dir:
             output_dir = Path(output_dir)
-            # Maintain folder structure by getting relative path from input root
-            input_root = Path(input_path).parent
-            while "IntroRemover" in input_root.parts:
-                input_root = input_root.parent
-            try:
-                rel_path = Path(input_path).parent.relative_to(input_root)
-            except ValueError:
-                # If no common root, just use the filename
-                rel_path = Path()
+            # Use the same relative path structure as the input
+            output_rel_path = Path(tracking_rel_path).parent
 
             # Create full output path maintaining structure
-            full_output_dir = output_dir / rel_path
+            full_output_dir = output_dir / output_rel_path
             full_output_dir.mkdir(parents=True, exist_ok=True)
 
             output_path = full_output_dir / output_filename
@@ -126,12 +161,8 @@ def process_file(file_info: tuple) -> bool:
         # Create backup if requested
         if make_backup and backup_dir:
             backup_dir = Path(backup_dir)
-            # Use same relative path structure for backups
-            backup_rel_path = (
-                Path(input_path).parent.relative_to(input_root)
-                if output_dir
-                else Path()
-            )
+            # Use the same relative path structure as the input
+            backup_rel_path = Path(tracking_rel_path).parent
             full_backup_dir = backup_dir / backup_rel_path
             full_backup_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,16 +178,27 @@ def process_file(file_info: tuple) -> bool:
                     return False
 
         # Get audio metadata and duration
-        probe = ffmpeg.probe(str(input_path))
-        duration = float(probe["streams"][0]["duration"])
+        try:
+            probe = ffmpeg.probe(str(input_path))
+            duration = float(probe["streams"][0]["duration"])
+        except ffmpeg.Error as e:
+            logger.error(f"Failed to probe {filename}: {e.stderr.decode()}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to probe {filename}: {str(e)}")
+            return False
 
         # Smart trim using silence detection
         if smart_trim:
-            nonsilent_ranges = detect_silence(str(input_path))
-            if nonsilent_ranges:
-                start_time = nonsilent_ranges[0][0] / 1000.0  # Convert to seconds
-            else:
-                start_time = duration_to_remove
+            try:
+                nonsilent_ranges = detect_silence(str(input_path))
+                if nonsilent_ranges:
+                    start_time = nonsilent_ranges[0][0] / 1000.0  # Convert to seconds
+                else:
+                    start_time = duration_to_remove
+            except Exception as e:
+                logger.error(f"Failed to detect silence in {filename}: {str(e)}")
+                return False
         else:
             start_time = duration_to_remove
 
@@ -184,53 +226,73 @@ def process_file(file_info: tuple) -> bool:
                 filter_complex.append(part)
 
             # Concatenate all parts
-            output_stream = ffmpeg.concat(*filter_complex, v=0, a=1)
+            stream = ffmpeg.concat(*filter_complex, v=0, a=1)
         else:
+            # Apply trimming
             if from_end:
                 duration_to_keep = duration - duration_to_remove
-                output_stream = input_stream.output(
-                    str(temp_output_path), t=duration_to_keep, **quality
-                )
+                stream = input_stream.filter("atrim", duration=duration_to_keep)
             else:
-                output_stream = input_stream.output(
-                    str(temp_output_path), ss=start_time, **quality
-                )
+                stream = input_stream.filter("atrim", start=start_time)
 
         # Add fade effects if specified
         if fade_duration:
-            output_stream = output_stream.filter("afade", t="in", d=fade_duration)
+            stream = stream.filter("afade", t="in", d=fade_duration)
             if from_end:
-                output_stream = output_stream.filter("afade", t="out", d=fade_duration)
+                stream = stream.filter("afade", t="out", d=fade_duration)
 
         # Set output codec based on format
         if output_format and output_format in SUPPORTED_FORMATS:
             quality["acodec"] = SUPPORTED_CODECS[output_format]
 
+        # Create the final output stream
+        output_stream = stream.output(str(temp_output_path), **quality)
         output_stream = output_stream.overwrite_output()
 
-        # Run ffmpeg
-        output_stream.run(capture_stdout=True, capture_stderr=True)
+        # Run ffmpeg with detailed error capture
+        try:
+            # Print the ffmpeg command for debugging
+            logger.debug(f"FFmpeg command: {' '.join(output_stream.get_args())}")
+            output_stream.run(capture_stdout=True, capture_stderr=True)
+        except ffmpeg.Error as e:
+            error_message = e.stderr.decode() if e.stderr else str(e)
+            logger.error(f"FFmpeg error processing {filename}: {error_message}")
+            if os.path.exists(str(temp_output_path)):
+                os.remove(str(temp_output_path))
+            return False
 
         # Move the temp file to final destination
         if os.path.exists(str(temp_output_path)):
-            if os.path.exists(str(output_path)):
-                os.remove(str(output_path))
-            os.rename(str(temp_output_path), str(output_path))
-            logger.info(f"Successfully processed: {filename}")
+            try:
+                if os.path.exists(str(output_path)):
+                    os.remove(str(output_path))
+                os.rename(str(temp_output_path), str(output_path))
+                logger.info(f"Successfully processed: {filename}")
 
-            if tracking_file and not dry_run:
-                processed_files = load_processed_files(tracking_file)
-                processed_files.add(rel_path)
-                save_processed_files(tracking_file, processed_files)
-                logger.info(f"Added to tracking file: {rel_path}")
+                if tracking_file and not dry_run:
+                    processed_files = load_processed_files(tracking_file)
+                    processed_files.add(tracking_rel_path)
+                    save_processed_files(tracking_file, processed_files)
+                    logger.info(f"Added to tracking file: {tracking_rel_path}")
 
-            return True
+                return True
+            except Exception as e:
+                logger.error(f"Failed to move temp file for {filename}: {str(e)}")
+                if os.path.exists(str(temp_output_path)):
+                    try:
+                        os.remove(str(temp_output_path))
+                    except:
+                        pass
+                return False
         else:
-            logger.error(f"Failed to process {filename}: Output file not created")
+            logger.error(
+                f"Failed to process {filename}: Output file was not created by FFmpeg"
+            )
             return False
 
     except ffmpeg.Error as e:
-        logger.error(f"FFmpeg error processing {filename}: {e.stderr.decode()}")
+        error_message = e.stderr.decode() if e.stderr else str(e)
+        logger.error(f"FFmpeg error processing {filename}: {error_message}")
         if os.path.exists(str(temp_output_path)):
             os.remove(str(temp_output_path))
         return False
@@ -296,19 +358,11 @@ def compute_audio_fingerprint(audio_path: str, sr: int = 22050) -> np.ndarray:
     if not librosa:
         raise ImportError("Required module not found. Please install librosa")
 
-    # Load audio with optimized parameters
-    y, sr = librosa.load(
-        audio_path, sr=sr, duration=30
-    )  # Only load first 30 seconds for fingerprint
+    # Load audio with a fixed duration if it's an intro template
+    y, sr = librosa.load(audio_path, sr=sr)
 
-    # Compute mel spectrogram with optimized parameters
-    mel_spec = librosa.feature.melspectrogram(
-        y=y,
-        sr=sr,
-        n_mels=64,  # Reduced number of mel bands
-        n_fft=1024,  # Smaller FFT window
-        hop_length=512,
-    )
+    # Compute mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr)
 
     # Convert to log scale
     mel_db = librosa.power_to_db(mel_spec, ref=np.max)
@@ -436,10 +490,6 @@ def remove_audio_duration(
     total_files = len(audio_files)
     processed_files = 0
 
-    # Use optimized number of workers if not specified
-    if max_workers is None:
-        max_workers = DEFAULT_MAX_WORKERS
-
     # Process files with progress bar
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
@@ -486,7 +536,7 @@ def remove_detected_intros(
     recursive: bool = True,
     quality: Optional[Dict] = None,
     match_threshold: float = 0.85,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
     backup_dir: Optional[str] = None,
     tracking_file: Optional[str] = None,
     force_process: bool = False,
@@ -500,6 +550,18 @@ def remove_detected_intros(
         raise ImportError(
             "Required modules not found. Please install: pip install librosa scipy"
         )
+
+    # Calculate number of workers for each pool
+    import multiprocessing
+
+    total_cpus = multiprocessing.cpu_count()
+    available_cpus = max(1, total_cpus - 2)
+    match_workers = max(1, available_cpus // 3)
+    process_workers = max(1, available_cpus - match_workers)
+
+    logger.info(
+        f"Using {match_workers} workers for matching and {process_workers} workers for processing"
+    )
 
     # Learn intro templates
     logger.info("Learning intro templates...")
@@ -525,98 +587,101 @@ def remove_detected_intros(
         return
 
     total_files = len(audio_files)
+    matched_files = 0
     processed_files = 0
+    files_to_process = 0
 
-    # Process files with progress bar
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for f in audio_files:
-            future = executor.submit(
-                process_file_with_template_matching,
-                (
-                    str(f),
-                    intro_templates,
-                    make_backup,
-                    output_dir,
-                    dry_run,
-                    quality or {},
-                    match_threshold,
-                    backup_dir,
-                    tracking_file,
-                    force_process,
-                    str(input_folder),
-                ),
+    def check_file_match(f):
+        """Check a single file for intro match."""
+        try:
+            input_path = Path(f).resolve()
+            tracking_rel_path = get_relative_path(str(input_path), str(input_folder))
+
+            # Check if already processed
+            if not force_process and tracking_file:
+                processed_files_set = load_processed_files(tracking_file)
+                if tracking_rel_path in processed_files_set:
+                    logger.info(f"Skipping already processed file: {tracking_rel_path}")
+                    return None
+
+            # Find intro match
+            intro_match, score, duration = find_intro_match(
+                str(input_path), intro_templates, match_threshold
             )
-            futures.append(future)
 
-        for future in futures:
+            if not intro_match:
+                logger.info(f"No intro match found for: {tracking_rel_path}")
+                return None
+
+            logger.info(
+                f"Found intro match in {tracking_rel_path}: {intro_match} (score: {score:.2f}, duration: {duration:.2f}s)"
+            )
+
+            return (input_path, duration, tracking_rel_path)
+        except Exception as e:
+            logger.error(f"Error checking file {tracking_rel_path}: {str(e)}")
+            return None
+
+    # Start matching files in parallel while processing
+    with ThreadPoolExecutor(
+        max_workers=match_workers
+    ) as match_executor, ThreadPoolExecutor(
+        max_workers=process_workers
+    ) as process_executor:
+
+        # Submit all files for matching
+        match_futures = [
+            match_executor.submit(check_file_match, f) for f in audio_files
+        ]
+        process_futures = []
+
+        # Process results as they come in
+        for future in match_futures:
             try:
-                future.result()
+                result = future.result()
+                matched_files += 1
+                if progress_callback:
+                    progress_callback(matched_files, total_files, "matching")
+
+                if result:
+                    files_to_process += 1
+                    input_path, duration, tracking_rel_path = result
+                    # Submit for processing
+                    process_future = process_executor.submit(
+                        process_file,
+                        (
+                            str(input_path),
+                            duration,
+                            make_backup,
+                            output_dir,
+                            dry_run,
+                            False,  # from_end
+                            quality or {},
+                            False,  # smart_trim
+                            None,  # fade_duration
+                            None,  # output_format
+                            None,  # segments
+                            backup_dir,
+                            tracking_file,
+                            force_process,
+                            str(input_folder),
+                        ),
+                    )
+                    process_futures.append((process_future, tracking_rel_path))
+            except Exception as e:
+                logger.error(f"Error in matching: {str(e)}")
+
+        logger.info(f"Matching complete. Processing {files_to_process} files...")
+
+        # Wait for all processing to complete
+        for future, rel_path in process_futures:
+            try:
+                success = future.result()
+                if not success:
+                    logger.error(f"Failed to process file: {rel_path}")
+            except Exception as e:
+                logger.error(f"Error processing file {rel_path}: {str(e)}")
+            finally:
                 processed_files += 1
                 if progress_callback:
-                    progress_callback(processed_files, total_files)
-            except Exception as e:
-                logger.error(f"Error processing file: {str(e)}")
-
-
-def process_file_with_template_matching(file_info: tuple) -> bool:
-    """Process a file using template matching."""
-    (
-        input_path,
-        intro_templates,
-        make_backup,
-        output_dir,
-        dry_run,
-        quality,
-        match_threshold,
-        backup_dir,
-        tracking_file,
-        force_process,
-        input_folder,
-    ) = file_info
-
-    filename = os.path.basename(input_path)
-    logger = logging.getLogger("audio_trimmer")
-
-    if dry_run:
-        logger.info(f"[DRY RUN] Would process: {filename}")
-        return True
-
-    try:
-        # Find matching intro
-        intro_match, score, duration = find_intro_match(
-            input_path, intro_templates, match_threshold
-        )
-
-        if not intro_match:
-            logger.info(f"No intro match found for: {filename}")
-            return False
-
-        logger.info(
-            f"Found intro match in {filename}: {intro_match} (score: {score:.2f}, duration: {duration:.2f}s)"
-        )
-
-        # Process the rest similar to the original process_file function
-        return process_file(
-            (
-                input_path,
-                duration,
-                make_backup,
-                output_dir,
-                dry_run,
-                False,  # from_end
-                quality,
-                False,  # smart_trim
-                None,  # fade_duration
-                None,  # output_format
-                None,  # segments
-                backup_dir,
-                tracking_file,
-                force_process,
-                input_folder,
-            )
-        )
-
-    except Exception as e:
-        logger.error(f"Error processing {filename}: {str(e)}")
-        return False
+                    progress_callback(processed_files, files_to_process, "processing")

@@ -483,11 +483,8 @@ class MainWindow:
                     progress_window.log("Error: Please select a template folder first.")
                     return
 
-                def update_progress(current, total):
-                    progress_window.update_progress(current, total)
-                    progress_window.update_status(
-                        f"Processing file {current} of {total}"
-                    )
+                def update_progress(current, total, phase):
+                    progress_window.update_progress(current, total, phase)
 
                 # Process based on mode
                 if current_tab == 1:  # Template mode
@@ -661,12 +658,42 @@ class ProgressWindow:
         self.log_display = scrolledtext.ScrolledText(self.window, height=15, width=70)
         self.log_display.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
 
-        # Create progress bar
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(
-            self.window, variable=self.progress_var, maximum=100, mode="determinate"
+        # Create progress bars frame
+        progress_frame = ttk.LabelFrame(self.window, text="Progress", padding="5")
+        progress_frame.pack(padx=10, pady=5, fill=tk.X)
+
+        # Create matching progress bar
+        ttk.Label(progress_frame, text="Matching:").grid(
+            row=0, column=0, sticky="w", padx=5
         )
-        self.progress_bar.pack(padx=10, pady=5, fill=tk.X)
+        self.match_progress_var = tk.DoubleVar()
+        self.match_progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.match_progress_var,
+            maximum=100,
+            mode="determinate",
+        )
+        self.match_progress_bar.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        self.match_status_label = ttk.Label(progress_frame, text="0/0")
+        self.match_status_label.grid(row=0, column=2, padx=5)
+
+        # Create processing progress bar
+        ttk.Label(progress_frame, text="Processing:").grid(
+            row=1, column=0, sticky="w", padx=5
+        )
+        self.process_progress_var = tk.DoubleVar()
+        self.process_progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.process_progress_var,
+            maximum=100,
+            mode="determinate",
+        )
+        self.process_progress_bar.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        self.process_status_label = ttk.Label(progress_frame, text="0/0")
+        self.process_status_label.grid(row=1, column=2, padx=5)
+
+        # Configure grid column weights
+        progress_frame.columnconfigure(1, weight=1)
 
         # Create status label
         self.status_label = ttk.Label(self.window, text="Initializing...")
@@ -679,15 +706,21 @@ class ProgressWindow:
         self.cancelled = False
         self.window.protocol("WM_DELETE_WINDOW", self.cancel)
 
-    def update_progress(self, value, total):
+    def update_progress(self, current: int, total: int, phase: str) -> None:
         """Update progress bar."""
-        progress = (value / total) * 100
-        self.progress_var.set(progress)
-        self.window.update_idletasks()
+        progress = (current / total) * 100 if total > 0 else 0
 
-    def update_status(self, text):
-        """Update status label."""
-        self.status_label.config(text=text)
+        if phase == "matching":
+            self.match_progress_var.set(progress)
+            self.match_status_label.config(text=f"{current}/{total}")
+            self.status_label.config(text=f"Matching files: {current}/{total}")
+        else:  # processing
+            self.process_progress_var.set(progress)
+            self.process_status_label.config(text=f"{current}/{total}")
+            self.status_label.config(
+                text=f"Processing matched files: {current}/{total}"
+            )
+
         self.window.update_idletasks()
 
     def log(self, message):
@@ -699,7 +732,7 @@ class ProgressWindow:
     def cancel(self):
         """Handle cancel button click."""
         self.cancelled = True
-        self.update_status("Cancelling...")
+        self.status_label.config(text="Cancelling...")
         self.cancel_button.config(state="disabled")
 
     def close(self):
