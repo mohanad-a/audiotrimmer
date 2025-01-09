@@ -1,6 +1,20 @@
-# Audio Intro Remover
+# Audio Intro Trimmer
 
-A powerful tool for batch processing audio files to remove intros, outros, or specific segments.
+A powerful tool for batch processing audio files to remove intros, outros, or specific segments. Supports both duration-based trimming and template-based intro detection.
+
+## Features
+
+- GUI and CLI interfaces
+- Two operation modes:
+  - Duration-based trimming (remove specific duration from start/end)
+  - Template-based intro detection and removal
+- Smart trimming with silence detection
+- Multi-CPU support for template matching
+- Audio quality presets
+- Fade in/out effects
+- Progress tracking and backup functionality
+- Recursive directory processing
+- Multiple audio format support
 
 ## Installation
 
@@ -66,74 +80,227 @@ A powerful tool for batch processing audio files to remove intros, outros, or sp
    pip install -r requirements.txt
    ```
 
-## Basic Usage
+## Usage
 
-Make sure your virtual environment is activated before running any commands:
+### GUI Mode
 
-```bash
-# On macOS/Linux:
-source venv/bin/activate
-# On Windows:
-.\venv\Scripts\activate
-```
-
-Remove 8.65 seconds from the beginning of all audio files in a folder:
+Launch the graphical interface:
 
 ```bash
-python main.py path/to/audio/folder
+# Make sure your virtual environment is activated
+source venv/bin/activate  # On macOS/Linux
+.\venv\Scripts\activate   # On Windows
+
+python -m introtrimmer --gui
 ```
 
-Specify custom duration:
+### CLI Mode
+
+#### Duration-based Trimming
+
+Remove a specific duration from audio files:
 
 ```bash
-python main.py path/to/audio/folder --duration 5.5
+python -m introtrimmer -i input_folder -d 5.5 -o output_folder
 ```
 
-## Advanced Features
+Options:
 
-1. Create backups before processing:
+- `-d`, `--duration`: Duration to remove in seconds
+- `--from-end`: Remove from end instead of start
+- `--smart-trim`: Use silence detection for smarter trimming
+- `--fade`: Add fade in/out effect (specify duration in seconds)
+
+#### Template-based Intro Detection
+
+Remove intros by matching against template files:
+
+```bash
+python -m introtrimmer -i input_folder -t template_folder -o output_folder
+```
+
+Options:
+
+- `-t`, `--template`: Folder containing intro template files
+- `--threshold`: Matching threshold (default: 0.85)
+- `--reserved-cpus`: CPUs to reserve for system (default: 2)
+- `--match-cpu-ratio`: Percentage of CPUs for matching (default: 33)
+
+### Common Options
+
+- `-i`, `--input`: Input folder containing audio files
+- `-o`, `--output`: Output folder for processed files
+- `-b`, `--backup`: Create backup of original files
+- `-r`, `--recursive`: Process files in subdirectories
+- `--dry-run`: Show what would be done without making changes
+- `--quality`: Audio quality preset (high/medium/low)
+- `--debug`: Enable debug logging
+
+### Advanced Options
+
+#### Audio Processing
+
+- `--smart-trim`: Use silence detection for smarter trimming
+- `--fade`: Add fade in/out effect (specify duration in seconds)
+- `--from-end`: Remove duration from end instead of start
+- `--segments`: JSON file specifying multiple segments to remove (format: [[start1, end1], [start2, end2]])
+- `--batch-config`: JSON file for batch processing with different durations per file
+
+#### Template Matching
+
+- `--threshold`: Matching threshold (0.0-1.0, default: 0.85)
+- `--reserved-cpus`: Number of CPUs to reserve for system (default: 2)
+- `--match-cpu-ratio`: Percentage of available CPUs for matching (10-90, default: 33)
+- `--template-format`: Format of template files (default: auto-detect)
+
+#### Output Control
+
+- `--output-format`: Force output format (.mp3, .wav, etc.)
+- `--preserve-metadata`: Keep original file metadata
+- `--overwrite`: Overwrite existing files without asking
+- `--progress`: Show progress bar during processing
+- `--log-file`: Path to save processing log
+- `--quiet`: Suppress non-error output
+
+## GUI Features
+
+The graphical interface provides an intuitive way to access all features:
+
+### Main Window
+
+- **Input/Output Selection**
+
+  - Browse button for input folder selection
+  - Browse button for output folder selection
+  - Option to create output folder if it doesn't exist
+  - Toggle for recursive directory processing
+
+- **Operation Mode**
+  - Duration-based trimming
+  - Template-based intro detection
+  - Batch processing with configuration file
+
+### Duration Mode Settings
+
+- Duration input field (seconds)
+- Position selector (start/end)
+- Smart trim toggle
+- Fade effect controls
+  - Fade in duration
+  - Fade out duration
+  - Fade curve type
+
+### Template Mode Settings
+
+- Template folder selection
+- Matching threshold slider
+- CPU allocation controls
+  - Reserved CPUs selector
+  - Matching CPU ratio slider
+- Template preview window
+
+### Quality Settings
+
+- Quality preset selector (high/medium/low)
+- Advanced quality controls:
+  - Bitrate
+  - Sample rate
+  - Channels
+  - Codec options
+
+### Processing Options
+
+- Backup toggle
+- Format conversion
+- Metadata preservation
+- Progress display
+  - Overall progress bar
+  - Current file progress
+  - Estimated time remaining
+  - Processing speed
+
+### Preview Features
+
+- Audio waveform display
+- Trim point markers
+- Play/pause controls
+- Zoom controls
+- Before/after comparison
+
+### Batch Processing
+
+- Batch configuration editor
+- File list with individual settings
+- Drag-and-drop support
+- Import/export configurations
+
+### Additional Features
+
+- Dark/light theme toggle
+- Recent folders history
+- Processing log viewer
+- Error notification system
+- Auto-save settings
+- Keyboard shortcuts
+
+## Supported Formats
+
+- MP3 (.mp3)
+- WAV (.wav)
+- M4A (.m4a)
+- AAC (.aac)
+- OGG (.ogg)
+- FLAC (.flac)
+
+## Examples
+
+1. Remove 10 seconds from the start of all files:
 
    ```bash
-   python main.py folder --backup
+   python -m introtrimmer -i audio_files -d 10 -o processed_files
    ```
 
-2. Save to different directory:
+2. Remove detected intros using templates:
 
    ```bash
-   python main.py folder --output-dir processed
+   python -m introtrimmer -i audio_files -t intro_templates -o processed_files --threshold 0.9
    ```
 
-3. Smart trim using silence detection:
+3. Smart trim with fade effect:
 
    ```bash
-   python main.py folder --smart-trim
+   python -m introtrimmer -i audio_files -d 5 -o processed_files --smart-trim --fade 0.5
    ```
 
-4. Add fade effects:
+4. High-quality processing with backups:
 
    ```bash
-   python main.py folder --fade-duration 2.0
+   python -m introtrimmer -i audio_files -d 8 -o processed_files -b --quality high
    ```
 
-5. Convert format:
+5. Process multiple segments:
 
    ```bash
-   python main.py folder --output-format .mp3 --audio-quality high
+   # Remove segments from 0-10s and 30-40s
+   python -m introtrimmer -i audio_files --segments segments.json -o processed_files
    ```
 
-6. Process multiple segments:
+6. Batch processing with different durations:
 
    ```bash
-   # Create segments.json:
-   # [[0, 10], [30, 40]]  # Removes 0-10s and 30-40s
-   python main.py folder --segments segments.json
+   # Process files with different trim durations
+   python -m introtrimmer -i audio_files --batch-config config.json -o processed_files
    ```
 
-7. Batch processing with different durations:
+7. High-quality MP3 conversion with metadata:
+
    ```bash
-   # Create batch_config.json:
-   # {"file1.mp3": 5.5, "file2.mp3": 10.2}
-   python main.py folder --batch-config batch_config.json
+   python -m introtrimmer -i audio_files -d 5 -o processed_files --output-format .mp3 --quality high --preserve-metadata
+   ```
+
+8. Template matching with custom CPU allocation:
+   ```bash
+   python -m introtrimmer -i audio_files -t templates -o processed_files --reserved-cpus 4 --match-cpu-ratio 50
    ```
 
 ## Troubleshooting
@@ -199,70 +366,26 @@ python main.py path/to/audio/folder --duration 5.5
 
 If you get FFmpeg-related errors:
 
-1. Make sure FFmpeg is installed and accessible from command line
-2. Try running `ffmpeg -version` to verify the installation
-3. On Windows, make sure FFmpeg is added to your system PATH
-
-## Supported Formats
-
-- MP3 (.mp3)
-- WAV (.wav)
-- M4A (.m4a)
-- AAC (.aac)
-- OGG (.ogg)
-- FLAC (.flac)
-
-## Options
-
-```bash
-python main.py --help
-```
-
-Key options:
-
-- `--duration`, `-d`: Duration to remove (seconds)
-- `--backup`, `-b`: Create backups
-- `--output-dir`, `-o`: Output directory
-- `--dry-run`: Preview changes without modifying files
-- `--from-end`: Remove from end instead of beginning
-- `--smart-trim`: Use silence detection
-- `--audio-quality`: Choose quality (high/medium/low)
-- `--gui`: Launch graphical interface
-- `--preview`: Preview audio before processing
-
-### Template-based Intro Removal
-
-1. Create a folder for your intro templates:
-
+1. Make sure FFmpeg is installed and accessible from command line:
    ```bash
-   mkdir intro_templates
+   ffmpeg -version
    ```
+2. On Windows, make sure FFmpeg is added to your system PATH
+3. Try reinstalling FFmpeg if you get codec-related errors
 
-2. Copy your intro template files into the folder:
+### Template Matching Issues
 
-   ```bash
-   cp intro1.mp3 intro2.mp3 intro3.mp3 intro_templates/
-   ```
+1. If matching is too strict (missing intros):
 
-3. Run the script with template matching:
+   - Lower the threshold value (e.g., `--threshold 0.80`)
+   - Use multiple template files for variations
 
-   ```bash
-   # Basic usage
-   python main.py your_audio_folder --template-folder intro_templates
+2. If matching is too lenient (false positives):
 
-   # With backup (recommended for first run)
-   python main.py your_audio_folder --template-folder intro_templates --backup
+   - Increase the threshold value (e.g., `--threshold 0.90`)
+   - Use more precise template files
 
-   # Test run first (no changes made)
-   python main.py your_audio_folder --template-folder intro_templates --dry-run
-   ```
-
-4. Adjust matching sensitivity if needed:
-
-   ```bash
-   # More strict matching (fewer false positives)
-   python main.py your_audio_folder --template-folder intro_templates --match-threshold 0.90
-
-   # More lenient matching (fewer false negatives)
-   python main.py your_audio_folder --template-folder intro_templates --match-threshold 0.80
-   ```
+3. If processing is too slow:
+   - Adjust CPU allocation with `--reserved-cpus` and `--match-cpu-ratio`
+   - Process fewer files at once
+   - Use smaller template files

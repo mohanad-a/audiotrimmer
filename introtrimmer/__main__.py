@@ -63,6 +63,24 @@ def main():
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
+    # CPU allocation arguments
+    import multiprocessing
+
+    total_cpus = multiprocessing.cpu_count()
+
+    parser.add_argument(
+        "--reserved-cpus",
+        type=int,
+        default=2,
+        help=f"Number of CPUs to reserve for system (0-{total_cpus-1}, default: 2)",
+    )
+    parser.add_argument(
+        "--match-cpu-ratio",
+        type=int,
+        default=33,
+        help="Percentage of available CPUs to use for matching (10-90, default: 33)",
+    )
+
     args = parser.parse_args()
 
     # Setup logging
@@ -91,7 +109,22 @@ def main():
     if args.duration and args.template:
         parser.error("Cannot use both --duration and --template at the same time")
 
+    # Validate CPU allocation arguments
+    if args.reserved_cpus < 0 or args.reserved_cpus >= total_cpus:
+        parser.error(f"Reserved CPUs must be between 0 and {total_cpus-1}")
+    if args.match_cpu_ratio < 10 or args.match_cpu_ratio > 90:
+        parser.error("Match CPU ratio must be between 10 and 90")
+
     try:
+        # Calculate CPU allocation for template mode
+        if args.template:
+            available_cpus = max(1, total_cpus - args.reserved_cpus)
+            match_workers = max(1, int(available_cpus * args.match_cpu_ratio / 100))
+            process_workers = max(1, available_cpus - match_workers)
+            logging.info(
+                f"CPU allocation: {match_workers} matching, {process_workers} processing, {args.reserved_cpus} reserved"
+            )
+
         # Template mode
         if args.template:
             remove_detected_intros(
@@ -103,6 +136,7 @@ def main():
                 recursive=args.recursive,
                 quality=QUALITY_PRESETS[args.quality],
                 match_threshold=args.threshold,
+                max_workers=(match_workers, process_workers),
             )
         # Basic mode
         else:

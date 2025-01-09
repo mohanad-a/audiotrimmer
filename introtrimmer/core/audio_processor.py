@@ -530,7 +530,7 @@ def remove_detected_intros(
     input_folder: str,
     template_folder: str,
     make_backup: bool = False,
-    max_workers: Optional[int] = None,
+    max_workers: Optional[tuple[int, int]] = None,  # (match_workers, process_workers)
     output_dir: Optional[str] = None,
     dry_run: bool = False,
     recursive: bool = True,
@@ -551,13 +551,17 @@ def remove_detected_intros(
             "Required modules not found. Please install: pip install librosa scipy"
         )
 
-    # Calculate number of workers for each pool
-    import multiprocessing
+    # Get worker counts
+    if max_workers is None:
+        # Calculate default worker counts
+        import multiprocessing
 
-    total_cpus = multiprocessing.cpu_count()
-    available_cpus = max(1, total_cpus - 2)
-    match_workers = max(1, available_cpus // 3)
-    process_workers = max(1, available_cpus - match_workers)
+        total_cpus = multiprocessing.cpu_count()
+        available_cpus = max(1, total_cpus - 2)  # Reserve 2 CPUs by default
+        match_workers = max(1, available_cpus // 3)
+        process_workers = max(1, available_cpus - match_workers)
+    else:
+        match_workers, process_workers = max_workers
 
     logger.info(
         f"Using {match_workers} workers for matching and {process_workers} workers for processing"

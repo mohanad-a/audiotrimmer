@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import os
+import multiprocessing
 
 from ..utils.constants import SUPPORTED_FORMATS, QUALITY_PRESETS
 from ..core.audio_processor import process_file, preview_audio
@@ -35,6 +36,11 @@ class MainWindow:
         self.template_input_folder = tk.StringVar()
         self.template_folder = tk.StringVar()
         self.match_threshold = tk.StringVar(value="0.85")
+
+        # CPU allocation variables
+        total_cpus = multiprocessing.cpu_count()
+        self.reserved_cpus = tk.StringVar(value="2")  # Default reserve 2 CPUs
+        self.match_cpu_ratio = tk.StringVar(value="33")  # Default 33% for matching
 
         # Common variables
         self.output_folder = tk.StringVar()
@@ -210,49 +216,85 @@ class MainWindow:
 
     def _create_advanced_widgets(self):
         """Create widgets for advanced options."""
+        # CPU Settings
+        cpu_frame = ttk.LabelFrame(
+            self.advanced_frame, text="CPU Settings", padding="5"
+        )
+        cpu_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=5)
+
+        total_cpus = multiprocessing.cpu_count()
+
+        # Reserved CPUs
+        ttk.Label(cpu_frame, text="Reserved CPUs:").grid(
+            row=0, column=0, sticky="w", padx=5
+        )
+        reserved_spin = ttk.Spinbox(
+            cpu_frame,
+            from_=0,
+            to=max(0, total_cpus - 1),
+            width=5,
+            textvariable=self.reserved_cpus,
+        )
+        reserved_spin.grid(row=0, column=1, sticky="w", padx=5)
+        ttk.Label(
+            cpu_frame, text=f"(0-{total_cpus-1}, higher = more responsive system)"
+        ).grid(row=0, column=2, sticky="w", padx=5)
+
+        # Matching CPU ratio
+        ttk.Label(cpu_frame, text="Matching CPU %:").grid(
+            row=1, column=0, sticky="w", padx=5
+        )
+        match_spin = ttk.Spinbox(
+            cpu_frame, from_=10, to=90, width=5, textvariable=self.match_cpu_ratio
+        )
+        match_spin.grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(cpu_frame, text="(10-90%, rest used for processing)").grid(
+            row=1, column=2, sticky="w", padx=5
+        )
+
         # Quality selection
         ttk.Label(self.advanced_frame, text="Audio Quality:").grid(
-            row=0, column=0, sticky="w"
+            row=1, column=0, sticky="w", pady=5
         )
         quality_combo = ttk.Combobox(
             self.advanced_frame,
             textvariable=self.quality,
             values=list(QUALITY_PRESETS.keys()),
         )
-        quality_combo.grid(row=0, column=1, sticky="w", padx=5)
+        quality_combo.grid(row=1, column=1, sticky="w", padx=5)
 
         # Fade duration
         ttk.Label(self.advanced_frame, text="Fade Duration:").grid(
-            row=1, column=0, sticky="w"
+            row=2, column=0, sticky="w"
         )
         ttk.Entry(self.advanced_frame, textvariable=self.fade_duration, width=10).grid(
-            row=1, column=1, sticky="w", padx=5
+            row=2, column=1, sticky="w", padx=5
         )
-        ttk.Label(self.advanced_frame, text="seconds").grid(row=1, column=2, sticky="w")
+        ttk.Label(self.advanced_frame, text="seconds").grid(row=2, column=2, sticky="w")
 
         # Smart trim
         ttk.Checkbutton(
             self.advanced_frame,
             text="Use smart trim (detect silence)",
             variable=self.smart_trim,
-        ).grid(row=2, column=0, columnspan=2, sticky="w")
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
 
         # Output folder
         ttk.Label(self.advanced_frame, text="Output Folder:").grid(
-            row=3, column=0, sticky="w"
+            row=4, column=0, sticky="w"
         )
         ttk.Entry(self.advanced_frame, textvariable=self.output_folder, width=50).grid(
-            row=3, column=1, columnspan=2, padx=5
+            row=4, column=1, columnspan=2, padx=5
         )
         ttk.Button(
             self.advanced_frame, text="Browse", command=self._select_output_folder
-        ).grid(row=3, column=3)
+        ).grid(row=4, column=3)
 
         # Backup folder
         backup_frame = ttk.LabelFrame(
             self.advanced_frame, text="Backup Settings", padding="5"
         )
-        backup_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=10)
+        backup_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Checkbutton(
             backup_frame, text="Create backups", variable=self.make_backup
@@ -270,7 +312,7 @@ class MainWindow:
         tracking_frame = ttk.LabelFrame(
             self.advanced_frame, text="Processing History", padding="5"
         )
-        tracking_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=10)
+        tracking_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Label(tracking_frame, text="Tracking File:").grid(
             row=0, column=0, sticky="w"
@@ -490,6 +532,28 @@ class MainWindow:
                 if current_tab == 1:  # Template mode
                     from ..core.audio_processor import remove_detected_intros
 
+                    # Calculate CPU allocation
+                    total_cpus = multiprocessing.cpu_count()
+                    try:
+                        reserved_cpus = int(self.reserved_cpus.get())
+                        match_ratio = int(self.match_cpu_ratio.get()) / 100.0
+                    except ValueError:
+                        reserved_cpus = 2
+                        match_ratio = 0.33
+
+                    # Ensure values are within valid ranges
+                    reserved_cpus = max(0, min(reserved_cpus, total_cpus - 1))
+                    match_ratio = max(0.1, min(match_ratio, 0.9))
+
+                    # Calculate available CPUs and worker distribution
+                    available_cpus = max(1, total_cpus - reserved_cpus)
+                    match_workers = max(1, int(available_cpus * match_ratio))
+                    process_workers = max(1, available_cpus - match_workers)
+
+                    progress_window.log(
+                        f"CPU allocation: {match_workers} matching, {process_workers} processing, {reserved_cpus} reserved"
+                    )
+
                     remove_detected_intros(
                         input_folder=self.template_input_folder.get(),
                         template_folder=self.template_folder.get(),
@@ -505,6 +569,7 @@ class MainWindow:
                         ),
                         tracking_file=self.tracking_file.get() or None,
                         force_process=self.force_process.get(),
+                        max_workers=(match_workers, process_workers),  # Pass as tuple
                     )
                 else:  # Basic mode
                     from ..core.audio_processor import remove_audio_duration
