@@ -54,6 +54,7 @@ class MainWindow:
         self.make_backup = tk.BooleanVar(value=True)
         self.recursive = tk.BooleanVar(value=True)
         self.smart_trim = tk.BooleanVar(value=False)
+        self.preserve_original_quality = tk.BooleanVar(value=False)
 
         self._create_widgets()
         self._create_layout()
@@ -253,15 +254,23 @@ class MainWindow:
         )
 
         # Quality selection
-        ttk.Label(self.advanced_frame, text="Audio Quality:").grid(
-            row=1, column=0, sticky="w", pady=5
+        quality_frame = ttk.LabelFrame(self.advanced_frame, text="Quality")
+        quality_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=5)
+        
+        # Quality preset dropdown
+        ttk.Label(quality_frame, text="Quality Preset:").grid(row=0, column=0, sticky="w", padx=5)
+        self.quality = ttk.Combobox(
+            quality_frame, values=list(QUALITY_PRESETS.keys()), state="readonly"
         )
-        quality_combo = ttk.Combobox(
-            self.advanced_frame,
-            textvariable=self.quality,
-            values=list(QUALITY_PRESETS.keys()),
-        )
-        quality_combo.grid(row=1, column=1, sticky="w", padx=5)
+        self.quality.set("high")
+        self.quality.grid(row=0, column=1, sticky="w", padx=5)
+
+        # Preserve original quality
+        ttk.Checkbutton(
+            quality_frame,
+            text="Preserve original quality",
+            variable=self.preserve_original_quality,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
         # Fade duration
         ttk.Label(self.advanced_frame, text="Fade Duration:").grid(
@@ -647,6 +656,7 @@ class MainWindow:
             "input_folder": input_folder,
             "make_backup": self.make_backup.get(),
             "recursive": self.recursive.get(),
+            "preserve_original_quality": self.preserve_original_quality.get(),
         }
 
         # Add output folder if specified

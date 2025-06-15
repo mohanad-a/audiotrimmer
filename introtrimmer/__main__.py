@@ -48,6 +48,11 @@ def main():
         help="Audio quality preset",
     )
     parser.add_argument(
+        "--preserve-original-quality",
+        action="store_true",
+        help="Preserve original codec and bitrate of input files",
+    )
+    parser.add_argument(
         "--smart-trim",
         action="store_true",
         help="Use silence detection for smarter trimming",
@@ -151,6 +156,7 @@ def main():
                 quality=QUALITY_PRESETS[args.quality],
                 smart_trim=args.smart_trim,
                 fade_duration=args.fade,
+                preserve_original_quality=args.preserve_original_quality,
             )
     except Exception as e:
         logging.error(str(e))

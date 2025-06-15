@@ -118,6 +118,7 @@ def process_file(file_info: tuple) -> bool:
         tracking_file,
         force_process,
         input_folder,
+        preserve_original_quality,
     ) = file_info
 
     try:
@@ -181,6 +182,18 @@ def process_file(file_info: tuple) -> bool:
         try:
             probe = ffmpeg.probe(str(input_path))
             duration = float(probe["streams"][0]["duration"])
+            
+            # Get original codec and bitrate
+            original_codec = probe["streams"][0].get("codec_name", "")
+            original_bitrate = probe["streams"][0].get("bit_rate", "")
+            
+            # If we have original codec and bitrate, use them instead of quality preset
+            if original_codec and original_bitrate:
+                quality = {
+                    "acodec": original_codec,
+                    "audio_bitrate": original_bitrate
+                }
+                logger.info(f"Using original codec: {original_codec} with bitrate: {original_bitrate}")
         except ffmpeg.Error as e:
             logger.error(f"Failed to probe {filename}: {e.stderr.decode()}")
             return False
@@ -445,6 +458,7 @@ def remove_audio_duration(
     backup_dir: Optional[str] = None,
     tracking_file: Optional[str] = None,
     force_process: bool = False,
+    preserve_original_quality: bool = False,
 ) -> None:
     """Remove duration from audio files."""
     logger = logging.getLogger("audio_trimmer")
@@ -512,6 +526,7 @@ def remove_audio_duration(
                     tracking_file,
                     force_process,
                     str(input_folder),
+                    preserve_original_quality,
                 ),
             )
             futures.append(future)
@@ -540,6 +555,7 @@ def remove_detected_intros(
     backup_dir: Optional[str] = None,
     tracking_file: Optional[str] = None,
     force_process: bool = False,
+    preserve_original_quality: bool = False,
 ) -> None:
     """Remove intros by matching against template files."""
     logger = logging.getLogger("audio_trimmer")
@@ -669,6 +685,7 @@ def remove_detected_intros(
                             tracking_file,
                             force_process,
                             str(input_folder),
+                            preserve_original_quality,
                         ),
                     )
                     process_futures.append((process_future, tracking_rel_path))
