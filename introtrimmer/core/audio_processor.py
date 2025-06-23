@@ -4,6 +4,8 @@ import os
 import ffmpeg
 import logging
 import json
+import gc
+import psutil
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Callable
 import numpy as np
@@ -12,6 +14,42 @@ from tqdm import tqdm
 
 from ..utils.loaders import load_audio_modules, load_audio_processing_modules
 from ..utils.constants import SUPPORTED_FORMATS, SUPPORTED_CODECS
+
+# Memory management constants
+MAX_AUDIO_DURATION_SECONDS = 300  # Limit audio loading to 5 minutes
+MEMORY_THRESHOLD_GB = 1  # Alert when available memory drops below 500MB
+BATCH_SIZE = 10  # Process files in smaller batches to prevent memory buildup
+
+
+def check_memory_usage():
+    """Check current memory usage and trigger cleanup if needed."""
+    memory = psutil.virtual_memory()
+    available_gb = memory.available / (1024**3)
+    
+    if available_gb < MEMORY_THRESHOLD_GB:
+        logging.warning(f"Low memory detected: {available_gb:.2f}GB available. Triggering garbage collection.")
+        gc.collect()
+        # Force cleanup of numpy arrays
+        import numpy as np
+        np.seterr(all='ignore')  # Suppress numpy warnings during cleanup
+        return True
+    return False
+
+
+def safe_load_audio(audio_path: str, sr: int = 22050, max_duration: float = None) -> Tuple[np.ndarray, int]:
+    """Safely load audio with memory management."""
+    librosa, _, _ = load_audio_processing_modules()
+    if not librosa:
+        raise ImportError("Required module not found. Please install librosa")
+    
+    try:
+        # Limit duration to prevent memory issues
+        duration = max_duration or MAX_AUDIO_DURATION_SECONDS
+        y, sr = librosa.load(audio_path, sr=sr, duration=duration)
+        return y, sr
+    except Exception as e:
+        logging.error(f"Error loading audio {audio_path}: {str(e)}")
+        raise
 
 
 def get_relative_path(file_path: str, input_folder: str) -> str:
@@ -122,6 +160,9 @@ def process_file(file_info: tuple) -> bool:
     ) = file_info
 
     try:
+        # Check memory before processing each file
+        check_memory_usage()
+        
         input_path = Path(input_path).resolve()
         input_folder = Path(input_folder).resolve()
         tracking_rel_path = get_relative_path(str(input_path), str(input_folder))
@@ -178,8 +219,9 @@ def process_file(file_info: tuple) -> bool:
                     logger.error(f"Failed to create backup for {filename}: {str(e)}")
                     return False
 
-        # Get audio metadata and duration
+        # Get audio metadata and duration with memory check
         try:
+            check_memory_usage()  # Check before ffmpeg operations
             probe = ffmpeg.probe(str(input_path))
             duration = float(probe["streams"][0]["duration"])
             
@@ -188,7 +230,7 @@ def process_file(file_info: tuple) -> bool:
             original_bitrate = probe["streams"][0].get("bit_rate", "")
             
             # If we have original codec and bitrate, use them instead of quality preset
-            if original_codec and original_bitrate:
+            if preserve_original_quality and original_codec and original_bitrate:
                 quality = {
                     "acodec": original_codec,
                     "audio_bitrate": original_bitrate
@@ -367,62 +409,89 @@ def preview_audio(audio_path: str, start_time: float = 0, duration: float = 10) 
 
 def compute_audio_fingerprint(audio_path: str, sr: int = 22050) -> np.ndarray:
     """Compute a fingerprint for an audio file."""
-    librosa, _, _ = load_audio_processing_modules()
-    if not librosa:
-        raise ImportError("Required module not found. Please install librosa")
-
-    # Load audio with a fixed duration if it's an intro template
-    y, sr = librosa.load(audio_path, sr=sr)
-
-    # Compute mel spectrogram
-    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr)
-
-    # Convert to log scale
-    mel_db = librosa.power_to_db(mel_spec, ref=np.max)
-
-    return mel_db
+    try:
+        # Use safe loading with duration limit for templates
+        y, sr = safe_load_audio(audio_path, sr=sr, max_duration=60)  # Limit templates to 60 seconds
+        
+        # Check memory before processing
+        check_memory_usage()
+        
+        # Compute mel spectrogram
+        librosa, _, _ = load_audio_processing_modules()
+        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr)
+        
+        # Convert to log scale
+        mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        # Clean up intermediate variables
+        del y, mel_spec
+        gc.collect()
+        
+        return mel_db
+    except Exception as e:
+        logging.error(f"Error computing fingerprint for {audio_path}: {str(e)}")
+        raise
 
 
 def find_intro_match(
     audio_path: str, intro_templates: Dict[str, np.ndarray], threshold: float = 0.85
 ) -> Tuple[Optional[str], float, float]:
     """Find if any of the intro templates match the beginning of the audio file."""
-    librosa, _, _ = load_audio_processing_modules()
-    if not librosa:
-        raise ImportError("Required module not found. Please install librosa")
-
-    # Load the target audio
-    y_target, sr = librosa.load(audio_path, sr=22050)
-    mel_target = librosa.feature.melspectrogram(y=y_target, sr=sr)
-    mel_db_target = librosa.power_to_db(mel_target, ref=np.max)
-
-    best_match = None
-    best_score = -1
-    best_duration = 0
-
-    for intro_name, intro_fingerprint in intro_templates.items():
-        # Get the duration of the intro template
-        intro_duration = intro_fingerprint.shape[1]
-
-        # Compare with the beginning of the target audio
-        target_segment = mel_db_target[:, :intro_duration]
-        if target_segment.shape[1] < intro_duration:
-            continue
-
-        # Compute correlation score
-        score = np.corrcoef(intro_fingerprint.flatten(), target_segment.flatten())[0, 1]
-
-        if score > threshold and score > best_score:
-            best_score = score
-            best_match = intro_name
-            best_duration = intro_duration
-
-    if best_match:
-        # Convert mel spectrogram frames to seconds
-        duration_seconds = librosa.frames_to_time(best_duration, sr=sr)
-        return best_match, best_score, duration_seconds
-
-    return None, 0, 0
+    try:
+        # Load only the beginning of the target audio (first 2 minutes should be enough)
+        y_target, sr = safe_load_audio(audio_path, sr=22050, max_duration=120)
+        
+        # Check memory before processing
+        check_memory_usage()
+        
+        librosa, _, _ = load_audio_processing_modules()
+        mel_target = librosa.feature.melspectrogram(y=y_target, sr=sr)
+        mel_db_target = librosa.power_to_db(mel_target, ref=np.max)
+        
+        # Clean up target audio data
+        del y_target, mel_target
+        gc.collect()
+        
+        best_match = None
+        best_score = -1
+        best_duration = 0
+        
+        for intro_name, intro_fingerprint in intro_templates.items():
+            try:
+                # Get the duration of the intro template
+                intro_duration = intro_fingerprint.shape[1]
+                
+                # Compare with the beginning of the target audio
+                target_segment = mel_db_target[:, :intro_duration]
+                if target_segment.shape[1] < intro_duration:
+                    continue
+                
+                # Compute correlation score
+                score = np.corrcoef(intro_fingerprint.flatten(), target_segment.flatten())[0, 1]
+                
+                if score > threshold and score > best_score:
+                    best_score = score
+                    best_match = intro_name
+                    best_duration = intro_duration
+                    
+            except Exception as e:
+                logging.warning(f"Error matching template {intro_name}: {str(e)}")
+                continue
+        
+        # Clean up
+        del mel_db_target
+        gc.collect()
+        
+        if best_match:
+            # Convert mel spectrogram frames to seconds
+            duration_seconds = librosa.frames_to_time(best_duration, sr=sr)
+            return best_match, best_score, duration_seconds
+        
+        return None, 0, 0
+        
+    except Exception as e:
+        logging.error(f"Error finding intro match for {audio_path}: {str(e)}")
+        return None, 0, 0
 
 
 def learn_intro_templates(template_folder: str) -> Dict[str, np.ndarray]:
@@ -503,42 +572,71 @@ def remove_audio_duration(
 
     total_files = len(audio_files)
     processed_files = 0
+    
+    # Limit max workers based on available memory
+    if max_workers is None:
+        memory = psutil.virtual_memory()
+        available_gb = memory.available / (1024**3)
+        # Use fewer workers if memory is limited
+        max_workers = min(4, max(1, int(available_gb // 2)))
+        logger.info(f"Auto-setting max_workers to {max_workers} based on available memory ({available_gb:.1f}GB)")
 
-    # Process files with progress bar
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for f in audio_files:
-            future = executor.submit(
-                process_file,
-                (
-                    str(f),
-                    batch_durations.get(f.name, duration_to_remove),
-                    make_backup,
-                    output_dir,
-                    dry_run,
-                    from_end,
-                    quality or {},
-                    smart_trim,
-                    fade_duration,
-                    output_format,
-                    segments,
-                    backup_dir,
-                    tracking_file,
-                    force_process,
-                    str(input_folder),
-                    preserve_original_quality,
-                ),
-            )
-            futures.append(future)
+    # Process files in batches to prevent memory buildup
+    batch_size = min(BATCH_SIZE, len(audio_files))
+    logger.info(f"Processing {total_files} files in batches of {batch_size}")
 
-        for future in futures:
-            try:
-                future.result()
-                processed_files += 1
-                if progress_callback:
-                    progress_callback(processed_files, total_files)
-            except Exception as e:
-                logger.error(f"Error processing file: {str(e)}")
+    for i in range(0, len(audio_files), batch_size):
+        batch_files = audio_files[i:i + batch_size]
+        logger.info(f"Processing batch {i//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size}")
+        
+        # Check memory before processing each batch
+        if check_memory_usage():
+            logger.warning("Low memory detected before batch processing. Consider reducing batch size or max_workers.")
+        
+        # Process files with progress bar
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for f in batch_files:
+                future = executor.submit(
+                    process_file,
+                    (
+                        str(f),
+                        batch_durations.get(f.name, duration_to_remove),
+                        make_backup,
+                        output_dir,
+                        dry_run,
+                        from_end,
+                        quality or {},
+                        smart_trim,
+                        fade_duration,
+                        output_format,
+                        segments,
+                        backup_dir,
+                        tracking_file,
+                        force_process,
+                        str(input_folder),
+                        preserve_original_quality,
+                    ),
+                )
+                futures.append(future)
+
+            for future in futures:
+                try:
+                    future.result()
+                    processed_files += 1
+                    if progress_callback:
+                        progress_callback(processed_files, total_files)
+                except Exception as e:
+                    logger.error(f"Error processing file: {str(e)}")
+        
+        # Force garbage collection between batches
+        gc.collect()
+        
+        # Log memory usage
+        memory = psutil.virtual_memory()
+        logger.info(f"Batch complete. Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
+
+    logger.info(f"Processing complete. Processed {processed_files}/{total_files} files.")
 
 
 def remove_detected_intros(
@@ -567,13 +665,21 @@ def remove_detected_intros(
             "Required modules not found. Please install: pip install librosa scipy"
         )
 
-    # Get worker counts
+    # Get worker counts with memory considerations
     if max_workers is None:
         # Calculate default worker counts
         import multiprocessing
-
+        memory = psutil.virtual_memory()
+        available_gb = memory.available / (1024**3)
+        
         total_cpus = multiprocessing.cpu_count()
         available_cpus = max(1, total_cpus - 2)  # Reserve 2 CPUs by default
+        
+        # Reduce workers if memory is limited
+        if available_gb < 4.0:  # Less than 4GB available
+            available_cpus = min(available_cpus, 2)
+            logger.warning(f"Limited memory detected ({available_gb:.1f}GB). Reducing CPU usage to prevent memory issues.")
+            
         match_workers = max(1, available_cpus // 3)
         process_workers = max(1, available_cpus - match_workers)
     else:
@@ -583,14 +689,22 @@ def remove_detected_intros(
         f"Using {match_workers} workers for matching and {process_workers} workers for processing"
     )
 
-    # Learn intro templates
+    # Learn intro templates with memory management
     logger.info("Learning intro templates...")
-    intro_templates = learn_intro_templates(template_folder)
+    try:
+        intro_templates = learn_intro_templates(template_folder)
+        
+        if not intro_templates:
+            raise ValueError(f"No valid intro templates found in {template_folder}")
 
-    if not intro_templates:
-        raise ValueError(f"No valid intro templates found in {template_folder}")
-
-    logger.info(f"Learned {len(intro_templates)} intro templates")
+        logger.info(f"Learned {len(intro_templates)} intro templates")
+        
+        # Check memory usage after loading templates
+        check_memory_usage()
+        
+    except Exception as e:
+        logger.error(f"Error learning templates: {str(e)}")
+        raise
 
     # Collect audio files
     input_folder = Path(input_folder)
@@ -624,7 +738,8 @@ def remove_detected_intros(
                     logger.info(f"Skipping already processed file: {tracking_rel_path}")
                     return None
 
-            # Find intro match
+            # Find intro match with memory monitoring
+            check_memory_usage()
             intro_match, score, duration = find_intro_match(
                 str(input_path), intro_templates, match_threshold
             )
@@ -642,67 +757,88 @@ def remove_detected_intros(
             logger.error(f"Error checking file {tracking_rel_path}: {str(e)}")
             return None
 
-    # Start matching files in parallel while processing
-    with ThreadPoolExecutor(
-        max_workers=match_workers
-    ) as match_executor, ThreadPoolExecutor(
-        max_workers=process_workers
-    ) as process_executor:
+    # Process files in batches to manage memory
+    batch_size = min(BATCH_SIZE * 2, len(audio_files))  # Slightly larger batches for matching
+    logger.info(f"Processing {total_files} files in batches of {batch_size}")
+    
+    for batch_start in range(0, len(audio_files), batch_size):
+        batch_end = min(batch_start + batch_size, len(audio_files))
+        batch_files = audio_files[batch_start:batch_end]
+        
+        logger.info(f"Processing batch {batch_start//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size}")
+        
+        # Check memory before each batch
+        if check_memory_usage():
+            logger.warning("Low memory detected. Consider reducing batch size or worker count.")
 
-        # Submit all files for matching
-        match_futures = [
-            match_executor.submit(check_file_match, f) for f in audio_files
-        ]
-        process_futures = []
+        # Start matching files in parallel while processing
+        with ThreadPoolExecutor(
+            max_workers=match_workers
+        ) as match_executor, ThreadPoolExecutor(
+            max_workers=process_workers
+        ) as process_executor:
 
-        # Process results as they come in
-        for future in match_futures:
-            try:
-                result = future.result()
-                matched_files += 1
-                if progress_callback:
-                    progress_callback(matched_files, total_files, "matching")
+            # Submit batch files for matching
+            match_futures = [
+                match_executor.submit(check_file_match, f) for f in batch_files
+            ]
+            process_futures = []
 
-                if result:
-                    files_to_process += 1
-                    input_path, duration, tracking_rel_path = result
-                    # Submit for processing
-                    process_future = process_executor.submit(
-                        process_file,
-                        (
-                            str(input_path),
-                            duration,
-                            make_backup,
-                            output_dir,
-                            dry_run,
-                            False,  # from_end
-                            quality or {},
-                            False,  # smart_trim
-                            None,  # fade_duration
-                            None,  # output_format
-                            None,  # segments
-                            backup_dir,
-                            tracking_file,
-                            force_process,
-                            str(input_folder),
-                            preserve_original_quality,
-                        ),
-                    )
-                    process_futures.append((process_future, tracking_rel_path))
-            except Exception as e:
-                logger.error(f"Error in matching: {str(e)}")
+            # Process results as they come in
+            for future in match_futures:
+                try:
+                    result = future.result()
+                    matched_files += 1
+                    if progress_callback:
+                        progress_callback(matched_files, total_files, "matching")
 
-        logger.info(f"Matching complete. Processing {files_to_process} files...")
+                    if result:
+                        files_to_process += 1
+                        input_path, duration, tracking_rel_path = result
+                        # Submit for processing
+                        process_future = process_executor.submit(
+                            process_file,
+                            (
+                                str(input_path),
+                                duration,
+                                make_backup,
+                                output_dir,
+                                dry_run,
+                                False,  # from_end
+                                quality or {},
+                                False,  # smart_trim
+                                None,  # fade_duration
+                                None,  # output_format
+                                None,  # segments
+                                backup_dir,
+                                tracking_file,
+                                force_process,
+                                str(input_folder),
+                                preserve_original_quality,
+                            ),
+                        )
+                        process_futures.append((process_future, tracking_rel_path))
+                except Exception as e:
+                    logger.error(f"Error in matching: {str(e)}")
 
-        # Wait for all processing to complete
-        for future, rel_path in process_futures:
-            try:
-                success = future.result()
-                if not success:
-                    logger.error(f"Failed to process file: {rel_path}")
-            except Exception as e:
-                logger.error(f"Error processing file {rel_path}: {str(e)}")
-            finally:
-                processed_files += 1
-                if progress_callback:
-                    progress_callback(processed_files, files_to_process, "processing")
+            # Wait for all processing in this batch to complete
+            for future, rel_path in process_futures:
+                try:
+                    success = future.result()
+                    if not success:
+                        logger.error(f"Failed to process file: {rel_path}")
+                except Exception as e:
+                    logger.error(f"Error processing file {rel_path}: {str(e)}")
+                finally:
+                    processed_files += 1
+                    if progress_callback:
+                        progress_callback(processed_files, files_to_process, "processing")
+        
+        # Force garbage collection between batches
+        gc.collect()
+        
+        # Log memory usage
+        memory = psutil.virtual_memory()
+        logger.info(f"Batch complete. Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
+
+    logger.info(f"Template matching complete. Processed {files_to_process} matching files out of {total_files} total files.")

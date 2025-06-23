@@ -9,6 +9,7 @@
 # Core dependencies (required)
 ffmpeg-python>=0.2.0
 tqdm>=4.65.0
+psutil>=5.9.0         # For memory monitoring and system resource management
 
 # Audio processing dependencies (required for template matching)
 librosa>=0.10.1       # For audio analysis and fingerprinting
