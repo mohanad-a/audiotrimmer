@@ -9,10 +9,11 @@ import psutil
 import signal
 import platform
 import tempfile
+import multiprocessing
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Callable
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 
 from ..utils.loaders import load_audio_modules, load_audio_processing_modules
@@ -26,20 +27,127 @@ BATCH_SIZE = 10  # Process files in smaller batches to prevent memory buildup
 # Platform-specific settings
 IS_MACOS = platform.system() == 'Darwin'
 
-# Signal handler for bus errors
-def bus_error_handler(signum, frame):
-    """Handle bus errors gracefully."""
-    logging.error(f"Bus error detected (Signal {signum}). Attempting graceful shutdown...")
+# Main process signal handler for bus errors
+def main_bus_error_handler(signum, frame):
+    """Handle bus errors gracefully in the main process."""
+    logging.error(f"Main process bus error detected (Signal {signum}). Cleaning up and exiting...")
     # Force garbage collection
     gc.collect()
     # Exit with error code
     os._exit(1)
 
-# Install signal handler for bus errors (Unix systems)
+# Install signal handler for main process
 if hasattr(signal, 'SIGBUS'):
-    signal.signal(signal.SIGBUS, bus_error_handler)
+    signal.signal(signal.SIGBUS, main_bus_error_handler)
 if hasattr(signal, 'SIGSEGV'):
-    signal.signal(signal.SIGSEGV, bus_error_handler)
+    signal.signal(signal.SIGSEGV, main_bus_error_handler)
+
+
+def get_optimal_worker_count(available_memory_gb: float, is_macos: bool = False) -> int:
+    """Calculate optimal worker count based on system resources."""
+    cpu_count = multiprocessing.cpu_count()
+    
+    # Base worker count on CPU cores
+    if is_macos:
+        # macOS is more prone to bus errors, so be more conservative
+        max_workers = max(1, min(2, cpu_count // 2))
+    else:
+        max_workers = max(1, cpu_count - 1)  # Reserve 1 CPU for system
+    
+    # Adjust based on available memory (assume ~500MB per worker)
+    memory_based_workers = max(1, int(available_memory_gb // 0.5))
+    
+    # Use the minimum of CPU and memory constraints
+    optimal_workers = min(max_workers, memory_based_workers)
+    
+    # Never use more than 4 workers to avoid overwhelming the system
+    return min(optimal_workers, 4)
+
+
+def init_worker():
+    """Initialize worker process with signal handlers and environment."""
+    # Set up signal handlers for worker processes
+    def worker_bus_error_handler(signum, frame):
+        logging.error(f"Worker process bus error (Signal {signum}). Exiting worker gracefully.")
+        gc.collect()
+        os._exit(1)
+    
+    # Install signal handlers for worker processes
+    if hasattr(signal, 'SIGBUS'):
+        signal.signal(signal.SIGBUS, worker_bus_error_handler)
+    if hasattr(signal, 'SIGSEGV'):
+        signal.signal(signal.SIGSEGV, worker_bus_error_handler)
+    
+    # Configure environment for worker processes on macOS
+    if IS_MACOS:
+        os.environ['OPENBLAS_NUM_THREADS'] = '1'
+        os.environ['MKL_NUM_THREADS'] = '1'
+        os.environ['NUMEXPR_NUM_THREADS'] = '1'
+        os.environ['OMP_NUM_THREADS'] = '1'
+
+
+def process_file_wrapper(args):
+    """Wrapper function for multiprocessing that handles individual file processing."""
+    try:
+        # Initialize logging for the worker process
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        
+        # Call the actual process_file function
+        result = process_file(args)
+        
+        # Force cleanup in worker process
+        gc.collect()
+        return result
+        
+    except Exception as e:
+        logging.error(f"Worker process error: {str(e)}")
+        # Force cleanup on error
+        gc.collect()
+        return False
+
+
+def process_batch_multiprocess(batch_tasks, max_workers=None, batch_id=None):
+    """Process a batch of files using multiprocessing for better isolation."""
+    logger = logging.getLogger("audio_trimmer")
+    
+    if batch_id:
+        logger.info(f"Processing batch {batch_id} with {len(batch_tasks)} files using {max_workers} processes")
+    
+    successful_tasks = 0
+    failed_tasks = 0
+    
+    try:
+        # Use ProcessPoolExecutor for better isolation
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=init_worker
+        ) as executor:
+            # Submit all tasks
+            future_to_task = {
+                executor.submit(process_file_wrapper, task): task 
+                for task in batch_tasks
+            }
+            
+            # Process results as they complete
+            for future in future_to_task:
+                try:
+                    result = future.result(timeout=600)  # 10 minute timeout per file
+                    if result:
+                        successful_tasks += 1
+                    else:
+                        failed_tasks += 1
+                        logger.warning(f"File processing returned False for a task in batch {batch_id}")
+                except Exception as e:
+                    failed_tasks += 1
+                    task = future_to_task[future]
+                    logger.error(f"Process failed for task in batch {batch_id}: {str(e)}")
+    
+    except Exception as e:
+        logger.error(f"Batch processing error for batch {batch_id}: {str(e)}")
+        failed_tasks = len(batch_tasks)
+    
+    logger.info(f"Batch {batch_id} complete: {successful_tasks} successful, {failed_tasks} failed")
+    return successful_tasks, failed_tasks
 
 
 def check_memory_usage():
@@ -124,31 +232,56 @@ def safe_ffmpeg_run(output_stream, max_retries: int = 2) -> bool:
     """Safely run FFmpeg with retries and bus error prevention."""
     for attempt in range(max_retries):
         try:
-            # On macOS, use additional safety flags
+            # Use ffmpeg-python's run method with additional safety on macOS
             if IS_MACOS:
-                # Run in separate process with timeout
-                import subprocess
-                import threading
+                # On macOS, add environment variables to prevent bus errors
+                old_env = {}
+                env_vars = {
+                    'OPENBLAS_NUM_THREADS': '1',
+                    'MKL_NUM_THREADS': '1', 
+                    'NUMEXPR_NUM_THREADS': '1',
+                    'OMP_NUM_THREADS': '1'
+                }
                 
-                cmd = output_stream.get_args()
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    preexec_fn=os.setsid if hasattr(os, 'setsid') else None
-                )
-                
-                # Set a timeout to prevent hanging
-                timer = threading.Timer(300.0, process.kill)  # 5 minute timeout
-                timer.start()
+                # Backup and set environment variables
+                for key, value in env_vars.items():
+                    old_env[key] = os.environ.get(key)
+                    os.environ[key] = value
                 
                 try:
-                    stdout, stderr = process.communicate()
-                    if process.returncode != 0:
-                        raise ffmpeg.Error('ffmpeg', stdout, stderr)
+                    # Run with timeout and capture output
+                    import signal
+                    
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("FFmpeg process timed out")
+                    
+                    # Set up timeout signal (5 minutes) - only if not in multiprocessing context
+                    timeout_set = False
+                    old_handler = None
+                    try:
+                        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(300)  # 5 minutes
+                        timeout_set = True
+                    except (ValueError, OSError):
+                        # Signal handling not available in this context (e.g., worker process)
+                        pass
+                    
+                    try:
+                        output_stream.run(capture_stdout=True, capture_stderr=True)
+                    finally:
+                        if timeout_set:
+                            signal.alarm(0)  # Cancel the alarm
+                            signal.signal(signal.SIGALRM, old_handler)
+                
                 finally:
-                    timer.cancel()
+                    # Restore environment variables
+                    for key, value in old_env.items():
+                        if value is None:
+                            os.environ.pop(key, None)
+                        else:
+                            os.environ[key] = value
             else:
+                # Non-macOS: use standard approach
                 output_stream.run(capture_stdout=True, capture_stderr=True)
             
             return True
@@ -158,6 +291,10 @@ def safe_ffmpeg_run(output_stream, max_retries: int = 2) -> bool:
                 raise
             # Clean up and retry
             gc.collect()
+        except TimeoutError as e:
+            logging.error(f"FFmpeg run attempt {attempt + 1} timed out: {e}")
+            if attempt == max_retries - 1:
+                raise
         except Exception as e:
             logging.error(f"Unexpected error during FFmpeg run attempt {attempt + 1}: {e}")
             if attempt == max_retries - 1:
@@ -671,6 +808,76 @@ def learn_intro_templates(template_folder: str) -> Dict[str, np.ndarray]:
     return templates
 
 
+def match_intro_wrapper(args):
+    """Wrapper function for multiprocessing intro matching."""
+    try:
+        # Initialize logging for the worker process
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        
+        f, intro_templates, match_threshold, input_folder, tracking_file, force_process = args
+        
+        # Import required modules in worker process
+        from pathlib import Path
+        
+        input_path = Path(f).resolve()
+        input_folder = Path(input_folder).resolve()
+        tracking_rel_path = get_relative_path(str(input_path), str(input_folder))
+
+        # Check if already processed
+        if not force_process and tracking_file:
+            processed_files_set = load_processed_files(tracking_file)
+            if tracking_rel_path in processed_files_set:
+                return None
+
+        # Find intro match with memory monitoring
+        check_memory_usage()
+        intro_match, score, duration = find_intro_match(
+            str(input_path), intro_templates, match_threshold
+        )
+
+        if not intro_match:
+            return None
+
+        return (input_path, duration, tracking_rel_path, intro_match, score)
+        
+    except Exception as e:
+        logging.error(f"Worker matching error: {str(e)}")
+        return None
+
+
+def process_matching_batch(match_tasks, max_workers=None, batch_id=None):
+    """Process a batch of intro matching using multiprocessing."""
+    logger = logging.getLogger("audio_trimmer")
+    
+    if batch_id:
+        logger.info(f"Matching batch {batch_id} with {len(match_tasks)} files using {max_workers} processes")
+    
+    matched_results = []
+    
+    try:
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=init_worker
+        ) as executor:
+            # Submit all matching tasks
+            futures = [executor.submit(match_intro_wrapper, task) for task in match_tasks]
+            
+            # Process results as they complete
+            for future in futures:
+                try:
+                    result = future.result(timeout=300)  # 5 minute timeout per match
+                    if result:
+                        matched_results.append(result)
+                except Exception as e:
+                    logger.error(f"Matching process failed: {str(e)}")
+    
+    except Exception as e:
+        logger.error(f"Batch matching error for batch {batch_id}: {str(e)}")
+    
+    logger.info(f"Matching batch {batch_id} complete: {len(matched_results)} matches found")
+    return matched_results
+
+
 def remove_audio_duration(
     input_folder: str,
     duration_to_remove: float,
@@ -740,64 +947,68 @@ def remove_audio_duration(
     if max_workers is None:
         memory = psutil.virtual_memory()
         available_gb = memory.available / (1024**3)
-        # Use fewer workers if memory is limited
-        max_workers = min(4, max(1, int(available_gb // 2)))
-        logger.info(f"Auto-setting max_workers to {max_workers} based on available memory ({available_gb:.1f}GB)")
+        max_workers = get_optimal_worker_count(available_gb, IS_MACOS)
+        logger.info(f"Auto-setting max_workers to {max_workers} based on available memory ({available_gb:.1f}GB) and platform (macOS: {IS_MACOS})")
+    else:
+        # Validate user-provided worker count
+        memory = psutil.virtual_memory()
+        available_gb = memory.available / (1024**3)
+        recommended_workers = get_optimal_worker_count(available_gb, IS_MACOS)
+        if max_workers > recommended_workers:
+            logger.warning(f"Requested {max_workers} workers exceeds recommended {recommended_workers} for your system. Consider reducing for better stability.")
 
     # Process files in batches to prevent memory buildup
     batch_size = min(BATCH_SIZE, len(audio_files))
-    logger.info(f"Processing {total_files} files in batches of {batch_size}")
+    logger.info(f"Processing {total_files} files in batches of {batch_size} using multiprocessing")
 
     for i in range(0, len(audio_files), batch_size):
         batch_files = audio_files[i:i + batch_size]
-        logger.info(f"Processing batch {i//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size}")
+        batch_id = f"{i//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size}"
         
         # Check memory before processing each batch
         if check_memory_usage():
             logger.warning("Low memory detected before batch processing. Consider reducing batch size or max_workers.")
         
-        # Process files with progress bar
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for f in batch_files:
-                future = executor.submit(
-                    process_file,
-                    (
-                        str(f),
-                        batch_durations.get(f.name, duration_to_remove),
-                        make_backup,
-                        output_dir,
-                        dry_run,
-                        from_end,
-                        quality or {},
-                        smart_trim,
-                        fade_duration,
-                        output_format,
-                        segments,
-                        backup_dir,
-                        tracking_file,
-                        force_process,
-                        str(input_folder),
-                        preserve_original_quality,
-                    ),
-                )
-                futures.append(future)
-
-            for future in futures:
-                try:
-                    future.result()
-                    processed_files += 1
-                    if progress_callback:
-                        progress_callback(processed_files, total_files)
-                except Exception as e:
-                    logger.error(f"Error processing file: {str(e)}")
+        # Prepare batch tasks
+        batch_tasks = []
+        for f in batch_files:
+            task = (
+                str(f),
+                batch_durations.get(f.name, duration_to_remove),
+                make_backup,
+                output_dir,
+                dry_run,
+                from_end,
+                quality or {},
+                smart_trim,
+                fade_duration,
+                output_format,
+                segments,
+                backup_dir,
+                tracking_file,
+                force_process,
+                str(input_folder),
+                preserve_original_quality,
+            )
+            batch_tasks.append(task)
+        
+        # Process batch using multiprocessing
+        successful, failed = process_batch_multiprocess(
+            batch_tasks, 
+            max_workers=max_workers, 
+            batch_id=batch_id
+        )
+        
+        processed_files += successful
+        if progress_callback:
+            progress_callback(processed_files, total_files)
         
         # Force garbage collection between batches
         gc.collect()
         
         # Log memory usage
         memory = psutil.virtual_memory()
-        logger.info(f"Batch complete. Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
+        logger.info(f"Batch {batch_id} complete. Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
 
     logger.info(f"Processing complete. Processed {processed_files}/{total_files} files.")
 
@@ -830,23 +1041,26 @@ def remove_detected_intros(
 
     # Get worker counts with memory considerations
     if max_workers is None:
-        # Calculate default worker counts
-        import multiprocessing
+        # Calculate default worker counts using the optimal calculation
         memory = psutil.virtual_memory()
         available_gb = memory.available / (1024**3)
         
-        total_cpus = multiprocessing.cpu_count()
-        available_cpus = max(1, total_cpus - 2)  # Reserve 2 CPUs by default
+        optimal_workers = get_optimal_worker_count(available_gb, IS_MACOS)
         
-        # Reduce workers if memory is limited
-        if available_gb < 4.0:  # Less than 4GB available
-            available_cpus = min(available_cpus, 2)
-            logger.warning(f"Limited memory detected ({available_gb:.1f}GB). Reducing CPU usage to prevent memory issues.")
-            
-        match_workers = max(1, available_cpus // 3)
-        process_workers = max(1, available_cpus - match_workers)
+        # Split workers between matching and processing (1/3 for matching, 2/3 for processing)
+        match_workers = max(1, optimal_workers // 3)
+        process_workers = max(1, optimal_workers - match_workers)
+        
+        logger.info(f"Auto-setting workers: {match_workers} for matching, {process_workers} for processing (total: {optimal_workers})")
     else:
         match_workers, process_workers = max_workers
+        # Validate user-provided worker counts
+        memory = psutil.virtual_memory()
+        available_gb = memory.available / (1024**3)
+        recommended_total = get_optimal_worker_count(available_gb, IS_MACOS)
+        total_requested = match_workers + process_workers
+        if total_requested > recommended_total:
+            logger.warning(f"Requested {total_requested} total workers exceeds recommended {recommended_total} for your system.")
 
     logger.info(
         f"Using {match_workers} workers for matching and {process_workers} workers for processing"
@@ -888,120 +1102,82 @@ def remove_detected_intros(
     processed_files = 0
     files_to_process = 0
 
-    def check_file_match(f):
-        """Check a single file for intro match."""
-        try:
-            input_path = Path(f).resolve()
-            tracking_rel_path = get_relative_path(str(input_path), str(input_folder))
-
-            # Check if already processed
-            if not force_process and tracking_file:
-                processed_files_set = load_processed_files(tracking_file)
-                if tracking_rel_path in processed_files_set:
-                    logger.info(f"Skipping already processed file: {tracking_rel_path}")
-                    return None
-
-            # Find intro match with memory monitoring
-            check_memory_usage()
-            intro_match, score, duration = find_intro_match(
-                str(input_path), intro_templates, match_threshold
-            )
-
-            if not intro_match:
-                logger.info(f"No intro match found for: {tracking_rel_path}")
-                return None
-
-            logger.info(
-                f"Found intro match in {tracking_rel_path}: {intro_match} (score: {score:.2f}, duration: {duration:.2f}s)"
-            )
-
-            return (input_path, duration, tracking_rel_path)
-        except Exception as e:
-            logger.error(f"Error checking file {tracking_rel_path}: {str(e)}")
-            return None
-
     # Process files in batches to manage memory
     batch_size = min(BATCH_SIZE * 2, len(audio_files))  # Slightly larger batches for matching
-    logger.info(f"Processing {total_files} files in batches of {batch_size}")
+    logger.info(f"Processing {total_files} files in batches of {batch_size} using multiprocessing")
     
     for batch_start in range(0, len(audio_files), batch_size):
         batch_end = min(batch_start + batch_size, len(audio_files))
         batch_files = audio_files[batch_start:batch_end]
-        
-        logger.info(f"Processing batch {batch_start//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size}")
+        batch_id = f"{batch_start//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size}"
         
         # Check memory before each batch
         if check_memory_usage():
             logger.warning("Low memory detected. Consider reducing batch size or worker count.")
 
-        # Start matching files in parallel while processing
-        with ThreadPoolExecutor(
-            max_workers=match_workers
-        ) as match_executor, ThreadPoolExecutor(
-            max_workers=process_workers
-        ) as process_executor:
-
-            # Submit batch files for matching
-            match_futures = [
-                match_executor.submit(check_file_match, f) for f in batch_files
-            ]
-            process_futures = []
-
-            # Process results as they come in
-            for future in match_futures:
-                try:
-                    result = future.result()
-                    matched_files += 1
-                    if progress_callback:
-                        progress_callback(matched_files, total_files, "matching")
-
-                    if result:
-                        files_to_process += 1
-                        input_path, duration, tracking_rel_path = result
-                        # Submit for processing
-                        process_future = process_executor.submit(
-                            process_file,
-                            (
-                                str(input_path),
-                                duration,
-                                make_backup,
-                                output_dir,
-                                dry_run,
-                                False,  # from_end
-                                quality or {},
-                                False,  # smart_trim
-                                None,  # fade_duration
-                                None,  # output_format
-                                None,  # segments
-                                backup_dir,
-                                tracking_file,
-                                force_process,
-                                str(input_folder),
-                                preserve_original_quality,
-                            ),
-                        )
-                        process_futures.append((process_future, tracking_rel_path))
-                except Exception as e:
-                    logger.error(f"Error in matching: {str(e)}")
-
-            # Wait for all processing in this batch to complete
-            for future, rel_path in process_futures:
-                try:
-                    success = future.result()
-                    if not success:
-                        logger.error(f"Failed to process file: {rel_path}")
-                except Exception as e:
-                    logger.error(f"Error processing file {rel_path}: {str(e)}")
-                finally:
-                    processed_files += 1
-                    if progress_callback:
-                        progress_callback(processed_files, files_to_process, "processing")
+        # Prepare matching tasks
+        match_tasks = []
+        for f in batch_files:
+            match_task = (f, intro_templates, match_threshold, str(input_folder), tracking_file, force_process)
+            match_tasks.append(match_task)
+        
+        # Process matching batch
+        matched_results = process_matching_batch(
+            match_tasks, 
+            max_workers=match_workers, 
+            batch_id=f"{batch_id}-match"
+        )
+        
+        matched_files += len(batch_files)
+        if progress_callback:
+            progress_callback(matched_files, total_files, "matching")
+        
+        # Prepare processing tasks for matched files
+        if matched_results:
+            process_tasks = []
+            for input_path, duration, tracking_rel_path, intro_match, score in matched_results:
+                logger.info(
+                    f"Found intro match in {tracking_rel_path}: {intro_match} (score: {score:.2f}, duration: {duration:.2f}s)"
+                )
+                
+                process_task = (
+                    str(input_path),
+                    duration,
+                    make_backup,
+                    output_dir,
+                    dry_run,
+                    False,  # from_end
+                    quality or {},
+                    False,  # smart_trim
+                    None,  # fade_duration
+                    None,  # output_format
+                    None,  # segments
+                    backup_dir,
+                    tracking_file,
+                    force_process,
+                    str(input_folder),
+                    preserve_original_quality,
+                )
+                process_tasks.append(process_task)
+            
+            # Process the matched files
+            if process_tasks:
+                files_to_process += len(process_tasks)
+                successful, failed = process_batch_multiprocess(
+                    process_tasks, 
+                    max_workers=process_workers, 
+                    batch_id=f"{batch_id}-process"
+                )
+                
+                processed_files += successful
+                if progress_callback:
+                    progress_callback(processed_files, files_to_process, "processing")
         
         # Force garbage collection between batches
         gc.collect()
         
         # Log memory usage
         memory = psutil.virtual_memory()
-        logger.info(f"Batch complete. Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
+        logger.info(f"Batch {batch_id} complete. Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
 
     logger.info(f"Template matching complete. Processed {files_to_process} matching files out of {total_files} total files.")

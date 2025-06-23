@@ -68,7 +68,7 @@ def main():
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
-    # CPU allocation arguments
+    # CPU allocation arguments (optional - automatic optimization is recommended)
     import multiprocessing
 
     total_cpus = multiprocessing.cpu_count()
@@ -76,14 +76,20 @@ def main():
     parser.add_argument(
         "--reserved-cpus",
         type=int,
-        default=2,
-        help=f"Number of CPUs to reserve for system (0-{total_cpus-1}, default: 2)",
+        default=None,
+        help=f"Number of CPUs to reserve for system (0-{total_cpus-1}). If not specified, uses automatic optimization.",
     )
     parser.add_argument(
         "--match-cpu-ratio",
         type=int,
-        default=33,
-        help="Percentage of available CPUs to use for matching (10-90, default: 33)",
+        default=None,
+        help="Percentage of available CPUs to use for matching (10-90). If not specified, uses automatic optimization.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum number of worker processes. If not specified, uses automatic optimization based on system resources.",
     )
 
     args = parser.parse_args()
@@ -115,23 +121,27 @@ def main():
         parser.error("Cannot use both --duration and --template at the same time")
 
     # Validate CPU allocation arguments
-    if args.reserved_cpus < 0 or args.reserved_cpus >= total_cpus:
+    if args.reserved_cpus is not None and (args.reserved_cpus < 0 or args.reserved_cpus >= total_cpus):
         parser.error(f"Reserved CPUs must be between 0 and {total_cpus-1}")
-    if args.match_cpu_ratio < 10 or args.match_cpu_ratio > 90:
+    if args.match_cpu_ratio is not None and (args.match_cpu_ratio < 10 or args.match_cpu_ratio > 90):
         parser.error("Match CPU ratio must be between 10 and 90")
 
     try:
-        # Calculate CPU allocation for template mode
         if args.template:
-            available_cpus = max(1, total_cpus - args.reserved_cpus)
-            match_workers = max(1, int(available_cpus * args.match_cpu_ratio / 100))
-            process_workers = max(1, available_cpus - match_workers)
-            logging.info(
-                f"CPU allocation: {match_workers} matching, {process_workers} processing, {args.reserved_cpus} reserved"
-            )
+            # Use automatic worker optimization unless manually specified
+            max_workers = None
+            if args.reserved_cpus is not None and args.match_cpu_ratio is not None:
+                # Manual CPU allocation (legacy mode)
+                available_cpus = max(1, total_cpus - args.reserved_cpus)
+                match_workers = max(1, int(available_cpus * args.match_cpu_ratio / 100))
+                process_workers = max(1, available_cpus - match_workers)
+                max_workers = (match_workers, process_workers)
+                logging.info(
+                    f"Manual CPU allocation: {match_workers} matching, {process_workers} processing, {args.reserved_cpus} reserved"
+                )
+            else:
+                logging.info("Using automatic worker optimization based on system resources")
 
-        # Template mode
-        if args.template:
             remove_detected_intros(
                 input_folder=args.input,
                 template_folder=args.template,
@@ -139,12 +149,13 @@ def main():
                 output_dir=args.output,
                 dry_run=args.dry_run,
                 recursive=args.recursive,
-                quality=QUALITY_PRESETS[args.quality],
                 match_threshold=args.threshold,
-                max_workers=(match_workers, process_workers),
+                max_workers=max_workers,  # None for automatic optimization
             )
-        # Basic mode
         else:
+            # Basic duration removal mode
+            max_workers = args.max_workers  # Use specified or None for auto
+            
             remove_audio_duration(
                 input_folder=args.input,
                 duration_to_remove=args.duration,
@@ -153,10 +164,7 @@ def main():
                 dry_run=args.dry_run,
                 recursive=args.recursive,
                 from_end=args.from_end,
-                quality=QUALITY_PRESETS[args.quality],
-                smart_trim=args.smart_trim,
-                fade_duration=args.fade,
-                preserve_original_quality=args.preserve_original_quality,
+                max_workers=max_workers,  # None for automatic optimization
             )
     except Exception as e:
         logging.error(str(e))

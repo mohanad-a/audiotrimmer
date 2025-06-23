@@ -9,17 +9,22 @@ import queue
 import logging
 import os
 import multiprocessing
+import psutil
 
 from ..utils.constants import SUPPORTED_FORMATS, QUALITY_PRESETS
-from ..core.audio_processor import process_file, preview_audio
+from ..core.audio_processor import process_file, preview_audio, get_optimal_worker_count, IS_MACOS
+from .settings import SettingsManager
 
 
 class MainWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Audio Intro Remover")
-        self.root.geometry("800x600")
-
+        
+        # Initialize settings manager
+        self.settings_manager = SettingsManager()
+        self.settings = self.settings_manager.load_settings()
+        
         # Set default tracking file in script root directory
         script_dir = Path(
             __file__
@@ -37,11 +42,6 @@ class MainWindow:
         self.template_folder = tk.StringVar()
         self.match_threshold = tk.StringVar(value="0.85")
 
-        # CPU allocation variables
-        total_cpus = multiprocessing.cpu_count()
-        self.reserved_cpus = tk.StringVar(value="2")  # Default reserve 2 CPUs
-        self.match_cpu_ratio = tk.StringVar(value="33")  # Default 33% for matching
-
         # Common variables
         self.output_folder = tk.StringVar()
         self.backup_folder = tk.StringVar()
@@ -56,11 +56,160 @@ class MainWindow:
         self.smart_trim = tk.BooleanVar(value=False)
         self.preserve_original_quality = tk.BooleanVar(value=False)
 
+        # Load settings after variables are created
+        self._load_gui_settings()
+        
+        # Set up close event handler to save settings
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
         self._create_widgets()
         self._create_layout()
+        
+        # Restore selected tab after widgets are created
+        try:
+            selected_tab = self.settings.get("window", {}).get("selected_tab", 0)
+            if hasattr(self, 'notebook') and selected_tab < self.notebook.index("end"):
+                self.notebook.select(selected_tab)
+        except Exception:
+            pass  # If tab selection fails, just use default
+
+    def _load_gui_settings(self):
+        """Load settings into GUI variables."""
+        try:
+            # Window settings
+            geometry = self.settings.get("window", {}).get("geometry", "800x600")
+            self.root.geometry(geometry)
+            
+            # Basic mode settings
+            basic = self.settings.get("basic_mode", {})
+            self.basic_input_folder.set(basic.get("input_folder", ""))
+            self.duration.set(basic.get("duration", "8.65"))
+            self.from_end.set(basic.get("from_end", False))
+            
+            # Template mode settings
+            template = self.settings.get("template_mode", {})
+            self.template_input_folder.set(template.get("input_folder", ""))
+            self.template_folder.set(template.get("template_folder", ""))
+            self.match_threshold.set(template.get("match_threshold", "0.85"))
+            
+            # Common paths
+            paths = self.settings.get("paths", {})
+            self.output_folder.set(paths.get("output_folder", ""))
+            self.backup_folder.set(paths.get("backup_folder", ""))
+            self.tracking_file.set(paths.get("tracking_file", self.default_tracking_file))
+            
+            # Processing options
+            processing = self.settings.get("processing", {})
+            quality_value = processing.get("quality", "high")
+            # Set quality after widget creation if combobox exists
+            if hasattr(self, 'quality_combo'):
+                self.quality_combo.set(quality_value)
+            else:
+                self.quality.set(quality_value)
+            self.fade_duration.set(processing.get("fade_duration", ""))
+            self.make_backup.set(processing.get("make_backup", True))
+            self.recursive.set(processing.get("recursive", True))
+            self.smart_trim.set(processing.get("smart_trim", False))
+            self.preserve_original_quality.set(processing.get("preserve_original_quality", False))
+            self.force_process.set(processing.get("force_process", False))
+            
+        except Exception as e:
+            logging.warning(f"Error loading GUI settings: {e}")
+
+    def _save_gui_settings(self):
+        """Save current GUI state to settings."""
+        try:
+            # Update settings with current values
+            self.settings["window"]["geometry"] = self.root.geometry()
+            self.settings["window"]["selected_tab"] = self.notebook.index(self.notebook.select()) if hasattr(self, 'notebook') else 0
+            
+            # Basic mode settings
+            self.settings["basic_mode"] = {
+                "input_folder": self.basic_input_folder.get(),
+                "duration": self.duration.get(),
+                "from_end": self.from_end.get()
+            }
+            
+            # Template mode settings
+            self.settings["template_mode"] = {
+                "input_folder": self.template_input_folder.get(),
+                "template_folder": self.template_folder.get(),
+                "match_threshold": self.match_threshold.get()
+            }
+            
+            # Common paths
+            self.settings["paths"] = {
+                "output_folder": self.output_folder.get(),
+                "backup_folder": self.backup_folder.get(),
+                "tracking_file": self.tracking_file.get()
+            }
+            
+            # Processing options - handle combobox properly
+            quality_value = "high"  # default
+            if hasattr(self, 'quality_combo'):
+                quality_value = self.quality_combo.get()
+            elif hasattr(self.quality, 'get'):
+                quality_value = self.quality.get()
+            
+            self.settings["processing"] = {
+                "quality": quality_value,
+                "fade_duration": self.fade_duration.get(),
+                "make_backup": self.make_backup.get(),
+                "recursive": self.recursive.get(),
+                "smart_trim": self.smart_trim.get(),
+                "preserve_original_quality": self.preserve_original_quality.get(),
+                "force_process": self.force_process.get()
+            }
+            
+            # Save to file
+            self.settings_manager.save_settings(self.settings)
+            
+        except Exception as e:
+            logging.warning(f"Error saving GUI settings: {e}")
+
+    def _on_closing(self):
+        """Handle window closing event."""
+        self._save_gui_settings()
+        self.root.destroy()
+
+    def _add_recent_folder(self, folder_type: str, folder_path: str):
+        """Add folder to recent folders and update settings."""
+        if folder_path and os.path.exists(folder_path):
+            self.settings_manager.add_recent_folder(folder_type, folder_path)
+
+    def _create_browse_with_recent(self, parent, textvariable, folder_type, title, command_callback):
+        """Create browse button with recent folders dropdown."""
+        frame = ttk.Frame(parent)
+        
+        # Browse button
+        browse_btn = ttk.Button(frame, text="Browse", command=command_callback)
+        browse_btn.pack(side=tk.LEFT, padx=(5, 2))
+        
+        # Recent folders dropdown
+        recent_folders = self.settings_manager.get_recent_folders(folder_type)
+        if recent_folders:
+            recent_var = tk.StringVar()
+            recent_combo = ttk.Combobox(frame, textvariable=recent_var, values=recent_folders, 
+                                      state="readonly", width=15)
+            recent_combo.pack(side=tk.LEFT, padx=2)
+            
+            def on_recent_select(event=None):
+                selected = recent_var.get()
+                if selected and os.path.exists(selected):
+                    textvariable.set(selected)
+            
+            recent_combo.bind("<<ComboboxSelected>>", on_recent_select)
+            
+            # Tooltip
+            ttk.Label(frame, text="Recent", font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT, padx=(2, 0))
+        
+        return frame
 
     def _create_widgets(self):
         """Create all GUI widgets."""
+        # Create menu bar
+        self._create_menu_bar()
+        
         # Notebook for different modes
         self.notebook = ttk.Notebook(self.root)
 
@@ -88,6 +237,49 @@ class MainWindow:
         # Create common controls
         self._create_common_controls()
 
+    def _create_menu_bar(self):
+        """Create the menu bar."""
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        # Settings menu
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        settings_menu.add_command(label="Reset to Defaults", command=self._reset_settings)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Save Current Settings", command=self._save_gui_settings)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Show Settings File Location", command=self._show_settings_location)
+
+    def _reset_settings(self):
+        """Reset all settings to defaults."""
+        result = messagebox.askyesno(
+            "Reset Settings", 
+            "This will reset all settings to defaults. Continue?",
+            icon='warning'
+        )
+        if result:
+            # Reset settings manager
+            self.settings_manager.reset_to_defaults()
+            # Reload settings
+            self.settings = self.settings_manager.load_settings()
+            # Apply to GUI
+            self._load_gui_settings()
+            messagebox.showinfo("Settings Reset", "All settings have been reset to defaults.")
+
+    def _show_settings_location(self):
+        """Show the location of the settings file."""
+        settings_file = str(self.settings_manager.settings_file)
+        message = f"Settings are stored in:\n{settings_file}"
+        
+        # Also show if file exists
+        if self.settings_manager.settings_file.exists():
+            message += "\n\nFile exists and is being used."
+        else:
+            message += "\n\nFile will be created when settings are saved."
+            
+        messagebox.showinfo("Settings Location", message)
+
     def _create_basic_widgets(self):
         """Create widgets for basic mode."""
         # Input folder selection
@@ -100,9 +292,11 @@ class MainWindow:
         ttk.Entry(input_frame, textvariable=self.basic_input_folder, width=50).grid(
             row=0, column=1, padx=5
         )
-        ttk.Button(
-            input_frame, text="Browse", command=self._select_basic_input_folder
-        ).grid(row=0, column=2)
+        browse_frame = self._create_browse_with_recent(
+            input_frame, self.basic_input_folder, "input_folders", 
+            "Select Input Folder", self._select_basic_input_folder
+        )
+        browse_frame.grid(row=0, column=2, sticky="w")
 
         # Settings frame
         settings_frame = ttk.LabelFrame(
@@ -156,9 +350,11 @@ class MainWindow:
         ttk.Entry(input_frame, textvariable=self.template_input_folder, width=50).grid(
             row=0, column=1, padx=5
         )
-        ttk.Button(
-            input_frame, text="Browse", command=self._select_template_input_folder
-        ).grid(row=0, column=2)
+        browse_frame = self._create_browse_with_recent(
+            input_frame, self.template_input_folder, "input_folders", 
+            "Select Input Folder", self._select_template_input_folder
+        )
+        browse_frame.grid(row=0, column=2, sticky="w")
 
         # Template folder selection
         template_frame = ttk.LabelFrame(
@@ -172,9 +368,11 @@ class MainWindow:
         ttk.Entry(template_frame, textvariable=self.template_folder, width=50).grid(
             row=0, column=1, padx=5
         )
-        ttk.Button(
-            template_frame, text="Browse", command=self._select_template_folder
-        ).grid(row=0, column=2)
+        browse_frame = self._create_browse_with_recent(
+            template_frame, self.template_folder, "template_folders", 
+            "Select Template Folder", self._select_template_folder
+        )
+        browse_frame.grid(row=0, column=2, sticky="w")
 
         # Settings frame
         settings_frame = ttk.LabelFrame(
@@ -217,53 +415,20 @@ class MainWindow:
 
     def _create_advanced_widgets(self):
         """Create widgets for advanced options."""
-        # CPU Settings
-        cpu_frame = ttk.LabelFrame(
-            self.advanced_frame, text="CPU Settings", padding="5"
-        )
-        cpu_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=5)
-
-        total_cpus = multiprocessing.cpu_count()
-
-        # Reserved CPUs
-        ttk.Label(cpu_frame, text="Reserved CPUs:").grid(
-            row=0, column=0, sticky="w", padx=5
-        )
-        reserved_spin = ttk.Spinbox(
-            cpu_frame,
-            from_=0,
-            to=max(0, total_cpus - 1),
-            width=5,
-            textvariable=self.reserved_cpus,
-        )
-        reserved_spin.grid(row=0, column=1, sticky="w", padx=5)
-        ttk.Label(
-            cpu_frame, text=f"(0-{total_cpus-1}, higher = more responsive system)"
-        ).grid(row=0, column=2, sticky="w", padx=5)
-
-        # Matching CPU ratio
-        ttk.Label(cpu_frame, text="Matching CPU %:").grid(
-            row=1, column=0, sticky="w", padx=5
-        )
-        match_spin = ttk.Spinbox(
-            cpu_frame, from_=10, to=90, width=5, textvariable=self.match_cpu_ratio
-        )
-        match_spin.grid(row=1, column=1, sticky="w", padx=5)
-        ttk.Label(cpu_frame, text="(10-90%, rest used for processing)").grid(
-            row=1, column=2, sticky="w", padx=5
-        )
-
         # Quality selection
         quality_frame = ttk.LabelFrame(self.advanced_frame, text="Quality")
-        quality_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=5)
+        quality_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=5)
         
         # Quality preset dropdown
         ttk.Label(quality_frame, text="Quality Preset:").grid(row=0, column=0, sticky="w", padx=5)
-        self.quality = ttk.Combobox(
+        self.quality_combo = ttk.Combobox(
             quality_frame, values=list(QUALITY_PRESETS.keys()), state="readonly"
         )
-        self.quality.set("high")
-        self.quality.grid(row=0, column=1, sticky="w", padx=5)
+        self.quality_combo.set("high")
+        self.quality_combo.grid(row=0, column=1, sticky="w", padx=5)
+        
+        # Keep the old variable for compatibility
+        self.quality = self.quality_combo
 
         # Preserve original quality
         ttk.Checkbutton(
@@ -272,38 +437,66 @@ class MainWindow:
             variable=self.preserve_original_quality,
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
+        # System info display
+        system_frame = ttk.LabelFrame(self.advanced_frame, text="System Information", padding="5")
+        system_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=5)
+        
+        memory = psutil.virtual_memory()
+        available_gb = memory.available / (1024**3)
+        optimal_workers = get_optimal_worker_count(available_gb, IS_MACOS)
+        
+        system_info = ttk.Label(
+            system_frame,
+            text=f"Platform: {'macOS' if IS_MACOS else 'Other'} | "
+                 f"CPU Cores: {multiprocessing.cpu_count()} | "
+                 f"Available Memory: {available_gb:.1f}GB | "
+                 f"Optimal Workers: {optimal_workers}",
+            justify=tk.LEFT
+        )
+        system_info.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        
+        info_label = ttk.Label(
+            system_frame,
+            text="Worker allocation is automatically optimized based on your system resources.",
+            justify=tk.LEFT,
+            foreground="gray"
+        )
+        info_label.grid(row=1, column=0, sticky="w", padx=5)
+
         # Fade duration
         ttk.Label(self.advanced_frame, text="Fade Duration:").grid(
-            row=2, column=0, sticky="w"
+            row=3, column=0, sticky="w"
         )
         ttk.Entry(self.advanced_frame, textvariable=self.fade_duration, width=10).grid(
-            row=2, column=1, sticky="w", padx=5
+            row=3, column=1, sticky="w", padx=5
         )
-        ttk.Label(self.advanced_frame, text="seconds").grid(row=2, column=2, sticky="w")
+        ttk.Label(self.advanced_frame, text="seconds").grid(row=3, column=2, sticky="w")
 
         # Smart trim
         ttk.Checkbutton(
             self.advanced_frame,
             text="Use smart trim (detect silence)",
             variable=self.smart_trim,
-        ).grid(row=3, column=0, columnspan=2, sticky="w")
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
 
         # Output folder
         ttk.Label(self.advanced_frame, text="Output Folder:").grid(
-            row=4, column=0, sticky="w"
+            row=5, column=0, sticky="w"
         )
         ttk.Entry(self.advanced_frame, textvariable=self.output_folder, width=50).grid(
-            row=4, column=1, columnspan=2, padx=5
+            row=5, column=1, columnspan=2, padx=5
         )
-        ttk.Button(
-            self.advanced_frame, text="Browse", command=self._select_output_folder
-        ).grid(row=4, column=3)
+        browse_frame = self._create_browse_with_recent(
+            self.advanced_frame, self.output_folder, "output_folders", 
+            "Select Output Folder", self._select_output_folder
+        )
+        browse_frame.grid(row=5, column=3, sticky="w")
 
         # Backup folder
         backup_frame = ttk.LabelFrame(
             self.advanced_frame, text="Backup Settings", padding="5"
         )
-        backup_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=10)
+        backup_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Checkbutton(
             backup_frame, text="Create backups", variable=self.make_backup
@@ -313,15 +506,17 @@ class MainWindow:
         ttk.Entry(backup_frame, textvariable=self.backup_folder, width=50).grid(
             row=1, column=1, padx=5
         )
-        ttk.Button(
-            backup_frame, text="Browse", command=self._select_backup_folder
-        ).grid(row=1, column=2)
+        browse_frame = self._create_browse_with_recent(
+            backup_frame, self.backup_folder, "backup_folders", 
+            "Select Backup Folder", self._select_backup_folder
+        )
+        browse_frame.grid(row=1, column=2, sticky="w")
 
         # Tracking settings
         tracking_frame = ttk.LabelFrame(
             self.advanced_frame, text="Processing History", padding="5"
         )
-        tracking_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=10)
+        tracking_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Label(tracking_frame, text="Tracking File:").grid(
             row=0, column=0, sticky="w"
@@ -329,9 +524,12 @@ class MainWindow:
         ttk.Entry(tracking_frame, textvariable=self.tracking_file, width=50).grid(
             row=0, column=1, padx=5
         )
+        
+        # For tracking file, we don't need recent files dropdown, just browse button
         ttk.Button(
             tracking_frame, text="Browse", command=self._select_tracking_file
-        ).grid(row=0, column=2)
+        ).grid(row=0, column=2, padx=5)
+        
         ttk.Button(
             tracking_frame,
             text="Reset to Default",
@@ -382,19 +580,21 @@ class MainWindow:
         """Select input folder for basic mode."""
         folder = filedialog.askdirectory(
             title="Select Input Folder",
-            initialdir=os.getcwd(),
+            initialdir=self.basic_input_folder.get() or os.getcwd(),
         )
         if folder:
             self.basic_input_folder.set(folder)
+            self._add_recent_folder("input_folders", folder)
 
     def _select_template_input_folder(self):
         """Select input folder for template mode."""
         folder = filedialog.askdirectory(
             title="Select Input Folder",
-            initialdir=os.getcwd(),
+            initialdir=self.template_input_folder.get() or os.getcwd(),
         )
         if folder:
             self.template_input_folder.set(folder)
+            self._add_recent_folder("input_folders", folder)
 
     def _select_output_folder(self):
         """Select output folder."""
@@ -406,23 +606,25 @@ class MainWindow:
             self.template_input_folder.get()
             if current_tab == 1
             else self.basic_input_folder.get()
-        ) or os.getcwd()
+        ) or self.output_folder.get() or os.getcwd()
 
         folder = filedialog.askdirectory(
             title="Select Output Folder", initialdir=start_dir
         )
         if folder:
             self.output_folder.set(folder)
+            self._add_recent_folder("output_folders", folder)
 
     def _select_template_folder(self):
         """Select template folder."""
         # Start from template input folder if selected, otherwise current directory
-        start_dir = self.template_input_folder.get() or os.getcwd()
+        start_dir = self.template_folder.get() or self.template_input_folder.get() or os.getcwd()
         folder = filedialog.askdirectory(
             title="Select Template Folder", initialdir=start_dir
         )
         if folder:
             self.template_folder.set(folder)
+            self._add_recent_folder("template_folders", folder)
 
     def _select_backup_folder(self):
         """Select backup folder."""
@@ -434,18 +636,19 @@ class MainWindow:
             self.template_input_folder.get()
             if current_tab == 1
             else self.basic_input_folder.get()
-        ) or os.getcwd()
+        ) or self.backup_folder.get() or os.getcwd()
 
         folder = filedialog.askdirectory(
             title="Select Backup Folder", initialdir=start_dir
         )
         if folder:
             self.backup_folder.set(folder)
+            self._add_recent_folder("backup_folders", folder)
 
     def _select_tracking_file(self):
         """Select tracking file."""
         # Default to script's root directory
-        start_dir = os.path.dirname(self.tracking_file.get())
+        start_dir = os.path.dirname(self.tracking_file.get()) or os.getcwd()
         filename = filedialog.asksaveasfilename(
             title="Select Tracking File",
             initialdir=start_dir,
@@ -455,6 +658,7 @@ class MainWindow:
         )
         if filename:
             self.tracking_file.set(filename)
+            # We don't add tracking files to recent folders since it's typically one file
 
     def _preview(self):
         """Preview the first file."""
@@ -541,28 +745,6 @@ class MainWindow:
                 if current_tab == 1:  # Template mode
                     from ..core.audio_processor import remove_detected_intros
 
-                    # Calculate CPU allocation
-                    total_cpus = multiprocessing.cpu_count()
-                    try:
-                        reserved_cpus = int(self.reserved_cpus.get())
-                        match_ratio = int(self.match_cpu_ratio.get()) / 100.0
-                    except ValueError:
-                        reserved_cpus = 2
-                        match_ratio = 0.33
-
-                    # Ensure values are within valid ranges
-                    reserved_cpus = max(0, min(reserved_cpus, total_cpus - 1))
-                    match_ratio = max(0.1, min(match_ratio, 0.9))
-
-                    # Calculate available CPUs and worker distribution
-                    available_cpus = max(1, total_cpus - reserved_cpus)
-                    match_workers = max(1, int(available_cpus * match_ratio))
-                    process_workers = max(1, available_cpus - match_workers)
-
-                    progress_window.log(
-                        f"CPU allocation: {match_workers} matching, {process_workers} processing, {reserved_cpus} reserved"
-                    )
-
                     remove_detected_intros(
                         input_folder=self.template_input_folder.get(),
                         template_folder=self.template_folder.get(),
@@ -570,7 +752,7 @@ class MainWindow:
                         output_dir=self.output_folder.get() or None,
                         dry_run=dry_run,
                         recursive=self.recursive.get(),
-                        quality=QUALITY_PRESETS.get(self.quality.get()),
+                        quality=QUALITY_PRESETS.get(self.quality_combo.get()),
                         match_threshold=float(self.match_threshold.get()),
                         progress_callback=update_progress,
                         backup_dir=(
@@ -578,7 +760,6 @@ class MainWindow:
                         ),
                         tracking_file=self.tracking_file.get() or None,
                         force_process=self.force_process.get(),
-                        max_workers=(match_workers, process_workers),  # Pass as tuple
                     )
                 else:  # Basic mode
                     from ..core.audio_processor import remove_audio_duration
@@ -591,7 +772,7 @@ class MainWindow:
                         dry_run=dry_run,
                         recursive=self.recursive.get(),
                         from_end=self.from_end.get(),
-                        quality=QUALITY_PRESETS.get(self.quality.get()),
+                        quality=QUALITY_PRESETS.get(self.quality_combo.get()),
                         smart_trim=self.smart_trim.get(),
                         fade_duration=(
                             float(self.fade_duration.get())
@@ -664,8 +845,8 @@ class MainWindow:
             params["output_dir"] = self.output_folder.get()
 
         # Add quality settings if specified
-        if self.quality.get():
-            params["quality"] = QUALITY_PRESETS[self.quality.get()]
+        if self.quality_combo.get():
+            params["quality"] = QUALITY_PRESETS[self.quality_combo.get()]
 
         # Add mode-specific parameters
         if current_tab == 0:  # Basic mode
