@@ -17,9 +17,19 @@ from ..utils.constants import SUPPORTED_FORMATS, SUPPORTED_CODECS
 
 # Memory management constants
 MAX_AUDIO_DURATION_SECONDS = 300  # Limit audio loading to 5 minutes
-MEMORY_THRESHOLD_GB = 1  # Alert when available memory drops below 500MB
+MEMORY_THRESHOLD_GB = 1  # Alert when available memory drops below 1GB
 BATCH_SIZE = 10  # Process files in smaller batches to prevent memory buildup
 CLEANUP_AFTER_EACH_FILE = True  # Clean memory after each file (can be disabled for speed)
+
+# Performance optimization constants
+ADAPTIVE_CLEANUP = True  # Only cleanup when memory is getting low
+FAST_BATCH_SIZE = 50  # Larger batch size for faster processing when memory allows
+MEMORY_CHECK_INTERVAL = 5  # Check memory every N files instead of every file
+FFMPEG_THREAD_COUNT = 2  # Number of threads for FFmpeg operations
+
+# Global counters for adaptive cleanup
+_file_counter = 0
+_last_memory_check = 0
 
 
 def set_cleanup_per_file(enabled: bool):
@@ -31,6 +41,31 @@ def set_cleanup_per_file(enabled: bool):
 def get_cleanup_per_file() -> bool:
     """Get current cleanup per file setting."""
     return CLEANUP_AFTER_EACH_FILE
+
+
+def should_cleanup_now() -> bool:
+    """Determine if we should perform cleanup now based on adaptive strategy."""
+    global _file_counter, _last_memory_check
+    _file_counter += 1
+    
+    if not CLEANUP_AFTER_EACH_FILE:
+        return False
+    
+    if not ADAPTIVE_CLEANUP:
+        return True  # Always cleanup if not using adaptive strategy
+    
+    # Check memory every MEMORY_CHECK_INTERVAL files
+    if _file_counter - _last_memory_check >= MEMORY_CHECK_INTERVAL:
+        _last_memory_check = _file_counter
+        memory = psutil.virtual_memory()
+        available_gb = memory.available / (1024**3)
+        
+        # Force cleanup if memory is low
+        if available_gb < MEMORY_THRESHOLD_GB:
+            return True
+    
+    # Regular cleanup every 10 files to prevent gradual buildup
+    return _file_counter % 10 == 0
 
 
 def check_memory_usage():
@@ -312,8 +347,15 @@ def process_file(file_info: tuple) -> bool:
         if output_format and output_format in SUPPORTED_FORMATS:
             quality["acodec"] = SUPPORTED_CODECS[output_format]
 
-        # Create the final output stream
-        output_stream = stream.output(str(temp_output_path), **quality)
+        # Create the final output stream with performance optimizations
+        ffmpeg_options = {**quality}
+        # Add FFmpeg threading for better performance
+        ffmpeg_options.update({
+            'threads': FFMPEG_THREAD_COUNT,
+            'preset': 'fast'  # Faster encoding preset
+        })
+        
+        output_stream = stream.output(str(temp_output_path), **ffmpeg_options)
         output_stream = output_stream.overwrite_output()
 
         # Run ffmpeg with detailed error capture
@@ -322,23 +364,20 @@ def process_file(file_info: tuple) -> bool:
             logger.debug(f"FFmpeg command: {' '.join(output_stream.get_args())}")
             output_stream.run(capture_stdout=True, capture_stderr=True)
             
-            # Aggressive cleanup after FFmpeg operation
-            if CLEANUP_AFTER_EACH_FILE:
-                # Clean up FFmpeg objects
-                del output_stream, stream, input_stream
+            # Adaptive memory cleanup (only when needed for better performance)
+            if should_cleanup_now():
                 gc.collect()
-                
+                memory = psutil.virtual_memory()
+                logger.debug(f"Memory after processing {filename}: {memory.percent:.1f}% used ({memory.available / (1024**3):.1f}GB available)")
+
+            return True
         except ffmpeg.Error as e:
             error_message = e.stderr.decode() if e.stderr else str(e)
             logger.error(f"FFmpeg error processing {filename}: {error_message}")
             if os.path.exists(str(temp_output_path)):
                 os.remove(str(temp_output_path))
             # Clean up on error
-            if CLEANUP_AFTER_EACH_FILE:
-                try:
-                    del output_stream, stream, input_stream
-                except:
-                    pass
+            if should_cleanup_now():
                 gc.collect()
             return False
 
@@ -356,8 +395,8 @@ def process_file(file_info: tuple) -> bool:
                     save_processed_files(tracking_file, processed_files)
                     logger.info(f"Added to tracking file: {tracking_rel_path}")
 
-                # Aggressive memory cleanup after each file
-                if CLEANUP_AFTER_EACH_FILE:
+                # Adaptive memory cleanup (only when needed for better performance)
+                if should_cleanup_now():
                     gc.collect()
                     memory = psutil.virtual_memory()
                     logger.debug(f"Memory after processing {filename}: {memory.percent:.1f}% used ({memory.available / (1024**3):.1f}GB available)")
@@ -504,8 +543,31 @@ def find_intro_match(
                 if target_segment.shape[1] < intro_duration:
                     continue
                 
-                # Compute correlation score
-                score = np.corrcoef(intro_fingerprint.flatten(), target_segment.flatten())[0, 1]
+                # Fast correlation score using optimized numpy operations
+                # Flatten and normalize for faster computation
+                intro_flat = intro_fingerprint.flatten()
+                target_flat = target_segment.flatten()
+                
+                # Use faster correlation computation
+                if len(intro_flat) == len(target_flat):
+                    # Pearson correlation coefficient (faster than np.corrcoef for large arrays)
+                    intro_mean = np.mean(intro_flat)
+                    target_mean = np.mean(target_flat)
+                    
+                    intro_centered = intro_flat - intro_mean
+                    target_centered = target_flat - target_mean
+                    
+                    numerator = np.dot(intro_centered, target_centered)
+                    denominator = np.sqrt(np.dot(intro_centered, intro_centered) * np.dot(target_centered, target_centered))
+                    
+                    score = numerator / denominator if denominator != 0 else 0
+                else:
+                    # Fallback to standard correlation for mismatched sizes
+                    score = np.corrcoef(intro_flat, target_flat)[0, 1]
+                
+                # Check for NaN and replace with 0
+                if np.isnan(score):
+                    score = 0
                 
                 if score > threshold and score > best_score:
                     best_score = score
@@ -619,9 +681,19 @@ def remove_audio_duration(
         max_workers = min(4, max(1, int(available_gb // 2)))
         logger.info(f"Auto-setting max_workers to {max_workers} based on available memory ({available_gb:.1f}GB)")
 
-    # Process files in batches to prevent memory buildup
-    batch_size = min(BATCH_SIZE, len(audio_files))
-    logger.info(f"Processing {total_files} files in batches of {batch_size}")
+    # Adaptive batch processing for better performance
+    memory = psutil.virtual_memory()
+    available_gb = memory.available / (1024**3)
+    
+    if available_gb >= 8.0:  # 8GB+ available - use large batches
+        batch_size = min(FAST_BATCH_SIZE, len(audio_files))
+        logger.info(f"High memory mode: Processing {total_files} files in large batches of {batch_size}")
+    elif available_gb >= 4.0:  # 4-8GB available - use medium batches
+        batch_size = min(BATCH_SIZE * 2, len(audio_files))
+        logger.info(f"Medium memory mode: Processing {total_files} files in batches of {batch_size}")
+    else:  # <4GB available - use small batches
+        batch_size = min(BATCH_SIZE, len(audio_files))
+        logger.info(f"Low memory mode: Processing {total_files} files in small batches of {batch_size}")
 
     for i in range(0, len(audio_files), batch_size):
         batch_files = audio_files[i:i + batch_size]
@@ -667,8 +739,9 @@ def remove_audio_duration(
                 except Exception as e:
                     logger.error(f"Error processing file: {str(e)}")
         
-        # Force garbage collection between batches
-        gc.collect()
+        # Only force garbage collection between batches if using adaptive cleanup
+        if ADAPTIVE_CLEANUP and (i + batch_size) % (batch_size * 3) == 0:  # Every 3 batches
+            gc.collect()
         
         # Log memory usage
         memory = psutil.virtual_memory()
@@ -880,3 +953,14 @@ def remove_detected_intros(
         logger.info(f"Batch complete. Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
 
     logger.info(f"Template matching complete. Processed {files_to_process} matching files out of {total_files} total files.")
+
+
+def set_ffmpeg_threads(threads: int):
+    """Set the number of threads for FFmpeg operations."""
+    global FFMPEG_THREAD_COUNT
+    FFMPEG_THREAD_COUNT = max(1, min(threads, 8))  # Limit to reasonable range
+
+
+def get_ffmpeg_threads() -> int:
+    """Get current FFmpeg thread count."""
+    return FFMPEG_THREAD_COUNT

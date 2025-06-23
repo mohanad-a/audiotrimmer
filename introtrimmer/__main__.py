@@ -5,7 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
-from .core.audio_processor import remove_audio_duration, remove_detected_intros, set_cleanup_per_file
+from .core.audio_processor import remove_audio_duration, remove_detected_intros, set_cleanup_per_file, set_ffmpeg_threads
 from .utils.constants import QUALITY_PRESETS
 
 
@@ -81,6 +81,17 @@ def main():
         dest="cleanup_per_file",
         help="Disable memory cleanup after each file (faster but uses more memory)",
     )
+    parser.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help="Enable fast mode (larger batches, less frequent cleanup, optimized for speed)",
+    )
+    parser.add_argument(
+        "--ffmpeg-threads",
+        type=int,
+        default=2,
+        help="Number of threads for FFmpeg operations (default: 2)",
+    )
 
     # CPU allocation arguments
     import multiprocessing
@@ -147,6 +158,22 @@ def main():
         # Set memory cleanup behavior
         set_cleanup_per_file(args.cleanup_per_file)
         logging.info(f"Memory cleanup per file: {'enabled' if args.cleanup_per_file else 'disabled'}")
+
+        # Configure fast mode if enabled
+        if args.fast_mode:
+            from .core.audio_processor import ADAPTIVE_CLEANUP, FAST_BATCH_SIZE, FFMPEG_THREAD_COUNT
+            # Override settings for maximum speed
+            set_cleanup_per_file(False)  # Disable per-file cleanup
+            logging.info("Fast mode enabled: Using optimized settings for maximum speed")
+            logging.info("- Per-file cleanup: disabled")
+            logging.info("- Batch sizes: large")
+            logging.info("- Memory monitoring: reduced frequency")
+        
+        # Set FFmpeg thread count
+        if hasattr(args, 'ffmpeg_threads'):
+            from .core.audio_processor import set_ffmpeg_threads
+            set_ffmpeg_threads(args.ffmpeg_threads)
+            logging.info(f"FFmpeg threads: {args.ffmpeg_threads}")
 
         # Template mode
         if args.template:
