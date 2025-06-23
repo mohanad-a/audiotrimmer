@@ -6,6 +6,9 @@ import logging
 import json
 import gc
 import psutil
+import signal
+import platform
+import tempfile
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Callable
 import numpy as np
@@ -19,6 +22,24 @@ from ..utils.constants import SUPPORTED_FORMATS, SUPPORTED_CODECS
 MAX_AUDIO_DURATION_SECONDS = 300  # Limit audio loading to 5 minutes
 MEMORY_THRESHOLD_GB = 1  # Alert when available memory drops below 500MB
 BATCH_SIZE = 10  # Process files in smaller batches to prevent memory buildup
+
+# Platform-specific settings
+IS_MACOS = platform.system() == 'Darwin'
+
+# Signal handler for bus errors
+def bus_error_handler(signum, frame):
+    """Handle bus errors gracefully."""
+    logging.error(f"Bus error detected (Signal {signum}). Attempting graceful shutdown...")
+    # Force garbage collection
+    gc.collect()
+    # Exit with error code
+    os._exit(1)
+
+# Install signal handler for bus errors (Unix systems)
+if hasattr(signal, 'SIGBUS'):
+    signal.signal(signal.SIGBUS, bus_error_handler)
+if hasattr(signal, 'SIGSEGV'):
+    signal.signal(signal.SIGSEGV, bus_error_handler)
 
 
 def check_memory_usage():
@@ -36,8 +57,40 @@ def check_memory_usage():
     return False
 
 
+def safe_ffmpeg_probe(audio_path: str, max_retries: int = 3) -> Optional[Dict]:
+    """Safely probe audio file with retries and error handling."""
+    for attempt in range(max_retries):
+        try:
+            # On macOS, add specific flags to prevent bus errors
+            if IS_MACOS:
+                # Use a separate process to isolate potential crashes
+                import subprocess
+                cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=duration,codec_name,bit_rate', '-of', 'json', str(audio_path)]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    import json
+                    probe = json.loads(result.stdout)
+                else:
+                    raise ffmpeg.Error('ffprobe', result.stdout, result.stderr)
+            else:
+                probe = ffmpeg.probe(str(audio_path))
+            return probe
+        except ffmpeg.Error as e:
+            logging.warning(f"FFmpeg probe attempt {attempt + 1} failed for {audio_path}: {e}")
+            if attempt == max_retries - 1:
+                raise
+            # Wait before retry
+            import time
+            time.sleep(0.1)
+        except Exception as e:
+            logging.error(f"Unexpected error during probe attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                raise
+    return None
+
+
 def safe_load_audio(audio_path: str, sr: int = 22050, max_duration: float = None) -> Tuple[np.ndarray, int]:
-    """Safely load audio with memory management."""
+    """Safely load audio with memory management and bus error prevention."""
     librosa, _, _ = load_audio_processing_modules()
     if not librosa:
         raise ImportError("Required module not found. Please install librosa")
@@ -45,11 +98,71 @@ def safe_load_audio(audio_path: str, sr: int = 22050, max_duration: float = None
     try:
         # Limit duration to prevent memory issues
         duration = max_duration or MAX_AUDIO_DURATION_SECONDS
-        y, sr = librosa.load(audio_path, sr=sr, duration=duration)
+        
+        # On macOS, use additional safety measures
+        if IS_MACOS:
+            # Set NumPy to use single-threaded BLAS to prevent bus errors
+            os.environ['OPENBLAS_NUM_THREADS'] = '1'
+            os.environ['MKL_NUM_THREADS'] = '1'
+            os.environ['NUMEXPR_NUM_THREADS'] = '1'
+            os.environ['OMP_NUM_THREADS'] = '1'
+        
+        # Load with offset to prevent bus errors on certain files
+        y, sr = librosa.load(audio_path, sr=sr, duration=duration, offset=0.0)
+        
+        # Ensure array is properly aligned for macOS
+        if IS_MACOS and not y.flags.aligned:
+            y = np.copy(y)
+        
         return y, sr
     except Exception as e:
         logging.error(f"Error loading audio {audio_path}: {str(e)}")
         raise
+
+
+def safe_ffmpeg_run(output_stream, max_retries: int = 2) -> bool:
+    """Safely run FFmpeg with retries and bus error prevention."""
+    for attempt in range(max_retries):
+        try:
+            # On macOS, use additional safety flags
+            if IS_MACOS:
+                # Run in separate process with timeout
+                import subprocess
+                import threading
+                
+                cmd = output_stream.get_args()
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    preexec_fn=os.setsid if hasattr(os, 'setsid') else None
+                )
+                
+                # Set a timeout to prevent hanging
+                timer = threading.Timer(300.0, process.kill)  # 5 minute timeout
+                timer.start()
+                
+                try:
+                    stdout, stderr = process.communicate()
+                    if process.returncode != 0:
+                        raise ffmpeg.Error('ffmpeg', stdout, stderr)
+                finally:
+                    timer.cancel()
+            else:
+                output_stream.run(capture_stdout=True, capture_stderr=True)
+            
+            return True
+        except ffmpeg.Error as e:
+            logging.warning(f"FFmpeg run attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise
+            # Clean up and retry
+            gc.collect()
+        except Exception as e:
+            logging.error(f"Unexpected error during FFmpeg run attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                raise
+    return False
 
 
 def get_relative_path(file_path: str, input_folder: str) -> str:
@@ -222,7 +335,11 @@ def process_file(file_info: tuple) -> bool:
         # Get audio metadata and duration with memory check
         try:
             check_memory_usage()  # Check before ffmpeg operations
-            probe = ffmpeg.probe(str(input_path))
+            probe = safe_ffmpeg_probe(str(input_path))
+            if not probe:
+                logger.error(f"Failed to probe {filename}: Unable to get file information")
+                return False
+            
             duration = float(probe["streams"][0]["duration"])
             
             # Get original codec and bitrate
@@ -237,7 +354,7 @@ def process_file(file_info: tuple) -> bool:
                 }
                 logger.info(f"Using original codec: {original_codec} with bitrate: {original_bitrate}")
         except ffmpeg.Error as e:
-            logger.error(f"Failed to probe {filename}: {e.stderr.decode()}")
+            logger.error(f"Failed to probe {filename}: {e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)}")
             return False
         except Exception as e:
             logger.error(f"Failed to probe {filename}: {str(e)}")
@@ -308,9 +425,13 @@ def process_file(file_info: tuple) -> bool:
         try:
             # Print the ffmpeg command for debugging
             logger.debug(f"FFmpeg command: {' '.join(output_stream.get_args())}")
-            output_stream.run(capture_stdout=True, capture_stderr=True)
+            if not safe_ffmpeg_run(output_stream):
+                logger.error(f"FFmpeg processing failed for {filename}")
+                if os.path.exists(str(temp_output_path)):
+                    os.remove(str(temp_output_path))
+                return False
         except ffmpeg.Error as e:
-            error_message = e.stderr.decode() if e.stderr else str(e)
+            error_message = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
             logger.error(f"FFmpeg error processing {filename}: {error_message}")
             if os.path.exists(str(temp_output_path)):
                 os.remove(str(temp_output_path))
@@ -407,6 +528,48 @@ def preview_audio(audio_path: str, start_time: float = 0, duration: float = 10) 
         raise
 
 
+def safe_correlation(x, y):
+    """Safely compute correlation to prevent bus errors."""
+    try:
+        # Ensure arrays are properly aligned
+        if IS_MACOS:
+            if not x.flags.aligned:
+                x = np.copy(x)
+            if not y.flags.aligned:
+                y = np.copy(y)
+        
+        # Flatten arrays to prevent shape issues
+        x_flat = x.flatten()
+        y_flat = y.flatten()
+        
+        # Ensure arrays have the same length
+        min_len = min(len(x_flat), len(y_flat))
+        x_flat = x_flat[:min_len]
+        y_flat = y_flat[:min_len]
+        
+        # Compute correlation with error handling
+        if len(x_flat) == 0 or len(y_flat) == 0:
+            return 0.0
+        
+        # Use manual correlation calculation to avoid numpy bus errors
+        x_mean = np.mean(x_flat)
+        y_mean = np.mean(y_flat)
+        
+        numerator = np.sum((x_flat - x_mean) * (y_flat - y_mean))
+        x_var = np.sum((x_flat - x_mean) ** 2)
+        y_var = np.sum((y_flat - y_mean) ** 2)
+        
+        if x_var == 0 or y_var == 0:
+            return 0.0
+        
+        correlation = numerator / np.sqrt(x_var * y_var)
+        return correlation
+        
+    except Exception as e:
+        logging.warning(f"Error in correlation calculation: {e}")
+        return 0.0
+
+
 def compute_audio_fingerprint(audio_path: str, sr: int = 22050) -> np.ndarray:
     """Compute a fingerprint for an audio file."""
     try:
@@ -467,7 +630,7 @@ def find_intro_match(
                     continue
                 
                 # Compute correlation score
-                score = np.corrcoef(intro_fingerprint.flatten(), target_segment.flatten())[0, 1]
+                score = safe_correlation(intro_fingerprint, target_segment)
                 
                 if score > threshold and score > best_score:
                     best_score = score
