@@ -5,7 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
-from .core.audio_processor import remove_audio_duration, remove_detected_intros
+from .core.audio_processor import remove_audio_duration, remove_detected_intros, set_cleanup_per_file
 from .utils.constants import QUALITY_PRESETS
 
 
@@ -68,6 +68,20 @@ def main():
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
+    # Memory management arguments
+    parser.add_argument(
+        "--cleanup-per-file",
+        action="store_true",
+        default=True,
+        help="Clean memory after each file (default: True, use --no-cleanup-per-file to disable)",
+    )
+    parser.add_argument(
+        "--no-cleanup-per-file",
+        action="store_false",
+        dest="cleanup_per_file",
+        help="Disable memory cleanup after each file (faster but uses more memory)",
+    )
+
     # CPU allocation arguments
     import multiprocessing
 
@@ -129,6 +143,10 @@ def main():
             logging.info(
                 f"CPU allocation: {match_workers} matching, {process_workers} processing, {args.reserved_cpus} reserved"
             )
+
+        # Set memory cleanup behavior
+        set_cleanup_per_file(args.cleanup_per_file)
+        logging.info(f"Memory cleanup per file: {'enabled' if args.cleanup_per_file else 'disabled'}")
 
         # Template mode
         if args.template:

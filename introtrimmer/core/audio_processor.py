@@ -19,6 +19,18 @@ from ..utils.constants import SUPPORTED_FORMATS, SUPPORTED_CODECS
 MAX_AUDIO_DURATION_SECONDS = 300  # Limit audio loading to 5 minutes
 MEMORY_THRESHOLD_GB = 1  # Alert when available memory drops below 500MB
 BATCH_SIZE = 10  # Process files in smaller batches to prevent memory buildup
+CLEANUP_AFTER_EACH_FILE = True  # Clean memory after each file (can be disabled for speed)
+
+
+def set_cleanup_per_file(enabled: bool):
+    """Set whether to perform aggressive memory cleanup after each file."""
+    global CLEANUP_AFTER_EACH_FILE
+    CLEANUP_AFTER_EACH_FILE = enabled
+
+
+def get_cleanup_per_file() -> bool:
+    """Get current cleanup per file setting."""
+    return CLEANUP_AFTER_EACH_FILE
 
 
 def check_memory_usage():
@@ -309,11 +321,25 @@ def process_file(file_info: tuple) -> bool:
             # Print the ffmpeg command for debugging
             logger.debug(f"FFmpeg command: {' '.join(output_stream.get_args())}")
             output_stream.run(capture_stdout=True, capture_stderr=True)
+            
+            # Aggressive cleanup after FFmpeg operation
+            if CLEANUP_AFTER_EACH_FILE:
+                # Clean up FFmpeg objects
+                del output_stream, stream, input_stream
+                gc.collect()
+                
         except ffmpeg.Error as e:
             error_message = e.stderr.decode() if e.stderr else str(e)
             logger.error(f"FFmpeg error processing {filename}: {error_message}")
             if os.path.exists(str(temp_output_path)):
                 os.remove(str(temp_output_path))
+            # Clean up on error
+            if CLEANUP_AFTER_EACH_FILE:
+                try:
+                    del output_stream, stream, input_stream
+                except:
+                    pass
+                gc.collect()
             return False
 
         # Move the temp file to final destination
@@ -329,6 +355,12 @@ def process_file(file_info: tuple) -> bool:
                     processed_files.add(tracking_rel_path)
                     save_processed_files(tracking_file, processed_files)
                     logger.info(f"Added to tracking file: {tracking_rel_path}")
+
+                # Aggressive memory cleanup after each file
+                if CLEANUP_AFTER_EACH_FILE:
+                    gc.collect()
+                    memory = psutil.virtual_memory()
+                    logger.debug(f"Memory after processing {filename}: {memory.percent:.1f}% used ({memory.available / (1024**3):.1f}GB available)")
 
                 return True
             except Exception as e:
@@ -350,11 +382,17 @@ def process_file(file_info: tuple) -> bool:
         logger.error(f"FFmpeg error processing {filename}: {error_message}")
         if os.path.exists(str(temp_output_path)):
             os.remove(str(temp_output_path))
+        # Cleanup on error too
+        if CLEANUP_AFTER_EACH_FILE:
+            gc.collect()
         return False
     except Exception as e:
         logger.error(f"Error processing {filename}: {str(e)}")
         if os.path.exists(str(temp_output_path)):
             os.remove(str(temp_output_path))
+        # Cleanup on error too
+        if CLEANUP_AFTER_EACH_FILE:
+            gc.collect()
         return False
 
 

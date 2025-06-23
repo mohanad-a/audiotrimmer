@@ -55,6 +55,9 @@ class MainWindow:
         self.recursive = tk.BooleanVar(value=True)
         self.smart_trim = tk.BooleanVar(value=False)
         self.preserve_original_quality = tk.BooleanVar(value=False)
+        
+        # Memory management variables
+        self.cleanup_per_file = tk.BooleanVar(value=True)
 
         self._create_widgets()
         self._create_layout()
@@ -288,22 +291,34 @@ class MainWindow:
             variable=self.smart_trim,
         ).grid(row=3, column=0, columnspan=2, sticky="w")
 
+        # Memory Management Settings
+        memory_frame = ttk.LabelFrame(
+            self.advanced_frame, text="Memory Management", padding="5"
+        )
+        memory_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=5)
+
+        ttk.Checkbutton(
+            memory_frame,
+            text="Clean memory after each file (safer but slightly slower)",
+            variable=self.cleanup_per_file,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=5)
+
         # Output folder
         ttk.Label(self.advanced_frame, text="Output Folder:").grid(
-            row=4, column=0, sticky="w"
+            row=5, column=0, sticky="w"
         )
         ttk.Entry(self.advanced_frame, textvariable=self.output_folder, width=50).grid(
-            row=4, column=1, columnspan=2, padx=5
+            row=5, column=1, columnspan=2, padx=5
         )
         ttk.Button(
             self.advanced_frame, text="Browse", command=self._select_output_folder
-        ).grid(row=4, column=3)
+        ).grid(row=5, column=3)
 
         # Backup folder
         backup_frame = ttk.LabelFrame(
             self.advanced_frame, text="Backup Settings", padding="5"
         )
-        backup_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=10)
+        backup_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Checkbutton(
             backup_frame, text="Create backups", variable=self.make_backup
@@ -321,7 +336,7 @@ class MainWindow:
         tracking_frame = ttk.LabelFrame(
             self.advanced_frame, text="Processing History", padding="5"
         )
-        tracking_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=10)
+        tracking_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Label(tracking_frame, text="Tracking File:").grid(
             row=0, column=0, sticky="w"
@@ -533,6 +548,11 @@ class MainWindow:
                 if current_tab == 1 and not self.template_folder.get():
                     progress_window.log("Error: Please select a template folder first.")
                     return
+
+                # Set memory cleanup behavior
+                from ..core.audio_processor import set_cleanup_per_file
+                set_cleanup_per_file(self.cleanup_per_file.get())
+                progress_window.log(f"Memory cleanup per file: {'enabled' if self.cleanup_per_file.get() else 'disabled'}")
 
                 def update_progress(current, total, phase):
                     progress_window.update_progress(current, total, phase)
