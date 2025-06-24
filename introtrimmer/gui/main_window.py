@@ -825,6 +825,7 @@ class MainWindow:
                         ),
                         tracking_file=self.tracking_file.get() or None,
                         force_process=self.force_process.get(),
+                        preserve_original_quality=self.preserve_original_quality.get(),
                     )
                 else:  # Basic mode
                     from ..core.audio_processor import remove_audio_duration
@@ -851,6 +852,7 @@ class MainWindow:
                         ),
                         tracking_file=self.tracking_file.get() or None,
                         force_process=self.force_process.get(),
+                        preserve_original_quality=self.preserve_original_quality.get(),
                     )
 
                 progress_window.update_status("Processing completed!")
