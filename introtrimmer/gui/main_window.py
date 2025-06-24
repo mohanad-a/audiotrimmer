@@ -56,6 +56,10 @@ class MainWindow:
         self.smart_trim = tk.BooleanVar(value=False)
         self.preserve_original_quality = tk.BooleanVar(value=False)
 
+        # Worker count controls
+        self.use_manual_workers = tk.BooleanVar(value=False)
+        self.manual_worker_count = tk.StringVar(value="4")
+
         # Load settings after variables are created
         self._load_gui_settings()
         
@@ -113,6 +117,10 @@ class MainWindow:
             self.preserve_original_quality.set(processing.get("preserve_original_quality", False))
             self.force_process.set(processing.get("force_process", False))
             
+            # Worker controls
+            self.use_manual_workers.set(processing.get("use_manual_workers", False))
+            self.manual_worker_count.set(processing.get("manual_worker_count", "4"))
+            
         except Exception as e:
             logging.warning(f"Error loading GUI settings: {e}")
 
@@ -158,7 +166,9 @@ class MainWindow:
                 "recursive": self.recursive.get(),
                 "smart_trim": self.smart_trim.get(),
                 "preserve_original_quality": self.preserve_original_quality.get(),
-                "force_process": self.force_process.get()
+                "force_process": self.force_process.get(),
+                "use_manual_workers": self.use_manual_workers.get(),
+                "manual_worker_count": self.manual_worker_count.get()
             }
             
             # Save to file
@@ -450,53 +460,90 @@ class MainWindow:
             text=f"Platform: {'macOS' if IS_MACOS else 'Other'} | "
                  f"CPU Cores: {multiprocessing.cpu_count()} | "
                  f"Available Memory: {available_gb:.1f}GB | "
-                 f"Optimal Workers: {optimal_workers}",
+                 f"Recommended Workers: {optimal_workers}",
             justify=tk.LEFT
         )
-        system_info.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        system_info.grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=5)
         
+        # Worker count controls
+        worker_frame = ttk.LabelFrame(self.advanced_frame, text="Worker Count Control", padding="5")
+        worker_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=5)
+        
+        ttk.Checkbutton(
+            worker_frame,
+            text="Use manual worker count (override automatic optimization)",
+            variable=self.use_manual_workers,
+            command=self._on_manual_workers_changed
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=2)
+        
+        ttk.Label(worker_frame, text="Total Workers:").grid(row=1, column=0, sticky="w", padx=5)
+        self.worker_count_spinbox = tk.Spinbox(
+            worker_frame, 
+            textvariable=self.manual_worker_count, 
+            from_=1, 
+            to=multiprocessing.cpu_count(),
+            width=5
+        )
+        self.worker_count_spinbox.grid(row=1, column=1, sticky="w", padx=5)
+        
+        ttk.Label(worker_frame, text=f"(1-{multiprocessing.cpu_count()})").grid(row=1, column=2, sticky="w")
+        
+        # Warning label
+        self.worker_warning_label = ttk.Label(
+            worker_frame,
+            text="⚠️ Higher worker counts may cause system instability on macOS",
+            foreground="orange",
+            font=("TkDefaultFont", 8)
+        )
+        self.worker_warning_label.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        
+        # Initially disable if auto mode
+        self._on_manual_workers_changed()
+
+        # Info label
         info_label = ttk.Label(
             system_frame,
-            text="Worker allocation is automatically optimized based on your system resources.",
+            text="Automatic optimization balances performance with system stability.",
             justify=tk.LEFT,
-            foreground="gray"
+            foreground="gray",
+            font=("TkDefaultFont", 8)
         )
-        info_label.grid(row=1, column=0, sticky="w", padx=5)
+        info_label.grid(row=1, column=0, columnspan=4, sticky="w", padx=5)
 
         # Fade duration
         ttk.Label(self.advanced_frame, text="Fade Duration:").grid(
-            row=3, column=0, sticky="w"
+            row=4, column=0, sticky="w"
         )
         ttk.Entry(self.advanced_frame, textvariable=self.fade_duration, width=10).grid(
-            row=3, column=1, sticky="w", padx=5
+            row=4, column=1, sticky="w", padx=5
         )
-        ttk.Label(self.advanced_frame, text="seconds").grid(row=3, column=2, sticky="w")
+        ttk.Label(self.advanced_frame, text="seconds").grid(row=4, column=2, sticky="w")
 
         # Smart trim
         ttk.Checkbutton(
             self.advanced_frame,
             text="Use smart trim (detect silence)",
             variable=self.smart_trim,
-        ).grid(row=4, column=0, columnspan=2, sticky="w")
+        ).grid(row=5, column=0, columnspan=2, sticky="w")
 
         # Output folder
         ttk.Label(self.advanced_frame, text="Output Folder:").grid(
-            row=5, column=0, sticky="w"
+            row=6, column=0, sticky="w"
         )
         ttk.Entry(self.advanced_frame, textvariable=self.output_folder, width=50).grid(
-            row=5, column=1, columnspan=2, padx=5
+            row=6, column=1, columnspan=2, padx=5
         )
         browse_frame = self._create_browse_with_recent(
             self.advanced_frame, self.output_folder, "output_folders", 
             "Select Output Folder", self._select_output_folder
         )
-        browse_frame.grid(row=5, column=3, sticky="w")
+        browse_frame.grid(row=6, column=3, sticky="w")
 
         # Backup folder
         backup_frame = ttk.LabelFrame(
             self.advanced_frame, text="Backup Settings", padding="5"
         )
-        backup_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=10)
+        backup_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Checkbutton(
             backup_frame, text="Create backups", variable=self.make_backup
@@ -516,7 +563,7 @@ class MainWindow:
         tracking_frame = ttk.LabelFrame(
             self.advanced_frame, text="Processing History", padding="5"
         )
-        tracking_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=10)
+        tracking_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=10)
 
         ttk.Label(tracking_frame, text="Tracking File:").grid(
             row=0, column=0, sticky="w"
@@ -741,6 +788,23 @@ class MainWindow:
                 def update_progress(current, total, phase):
                     progress_window.update_progress(current, total, phase)
 
+                # Get worker count
+                if self.use_manual_workers.get():
+                    try:
+                        total_workers = int(self.manual_worker_count.get())
+                        # For template mode, split workers (1/3 for matching, 2/3 for processing)
+                        if current_tab == 1:
+                            match_workers = max(1, total_workers // 3)
+                            process_workers = total_workers - match_workers
+                            worker_tuple = (match_workers, process_workers)
+                        else:
+                            worker_tuple = total_workers
+                    except ValueError:
+                        progress_window.log("Error: Invalid worker count. Using automatic optimization.")
+                        worker_tuple = None
+                else:
+                    worker_tuple = None
+
                 # Process based on mode
                 if current_tab == 1:  # Template mode
                     from ..core.audio_processor import remove_detected_intros
@@ -749,6 +813,7 @@ class MainWindow:
                         input_folder=self.template_input_folder.get(),
                         template_folder=self.template_folder.get(),
                         make_backup=self.make_backup.get(),
+                        max_workers=worker_tuple,
                         output_dir=self.output_folder.get() or None,
                         dry_run=dry_run,
                         recursive=self.recursive.get(),
@@ -768,6 +833,7 @@ class MainWindow:
                         input_folder=self.basic_input_folder.get(),
                         duration_to_remove=float(self.duration.get()),
                         make_backup=self.make_backup.get(),
+                        max_workers=worker_tuple,
                         output_dir=self.output_folder.get() or None,
                         dry_run=dry_run,
                         recursive=self.recursive.get(),
@@ -898,6 +964,15 @@ class MainWindow:
             preview_audio(str(file_path))
         except Exception as e:
             messagebox.showerror("Error", f"Error previewing file: {str(e)}")
+
+    def _on_manual_workers_changed(self):
+        """Handle changes to manual worker controls."""
+        if self.use_manual_workers.get():
+            self.worker_count_spinbox.config(state="normal")
+            self.worker_warning_label.config(foreground="red")
+        else:
+            self.worker_count_spinbox.config(state="disabled")
+            self.worker_warning_label.config(foreground="gray")
 
 
 class ProgressWindow:

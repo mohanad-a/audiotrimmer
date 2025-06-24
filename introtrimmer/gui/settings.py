@@ -70,7 +70,9 @@ class SettingsManager:
                 "recursive": True,
                 "smart_trim": False,
                 "preserve_original_quality": False,
-                "force_process": False
+                "force_process": False,
+                "use_manual_workers": False,
+                "manual_worker_count": "4"
             },
             
             # Recent folders for convenience

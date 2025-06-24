@@ -43,14 +43,19 @@ if hasattr(signal, 'SIGSEGV'):
     signal.signal(signal.SIGSEGV, main_bus_error_handler)
 
 
-def get_optimal_worker_count(available_memory_gb: float, is_macos: bool = False) -> int:
+def get_optimal_worker_count(available_memory_gb: float, is_macos: bool = False, override_workers: int = None) -> int:
     """Calculate optimal worker count based on system resources."""
+    if override_workers is not None:
+        # Allow manual override but still cap at reasonable limits
+        return min(max(1, override_workers), multiprocessing.cpu_count())
+    
     cpu_count = multiprocessing.cpu_count()
     
     # Base worker count on CPU cores
     if is_macos:
-        # macOS is more prone to bus errors, so be more conservative
-        max_workers = max(1, min(2, cpu_count // 2))
+        # macOS: Be less conservative but still cautious
+        # Allow up to 50% of cores or 4 workers, whichever is smaller
+        max_workers = max(2, min(4, cpu_count // 2))
     else:
         max_workers = max(1, cpu_count - 1)  # Reserve 1 CPU for system
     
@@ -60,8 +65,8 @@ def get_optimal_worker_count(available_memory_gb: float, is_macos: bool = False)
     # Use the minimum of CPU and memory constraints
     optimal_workers = min(max_workers, memory_based_workers)
     
-    # Never use more than 4 workers to avoid overwhelming the system
-    return min(optimal_workers, 4)
+    # Cap at 8 workers to avoid overwhelming the system (increased from 4)
+    return min(optimal_workers, 8)
 
 
 def init_worker():
@@ -949,6 +954,13 @@ def remove_audio_duration(
         available_gb = memory.available / (1024**3)
         max_workers = get_optimal_worker_count(available_gb, IS_MACOS)
         logger.info(f"Auto-setting max_workers to {max_workers} based on available memory ({available_gb:.1f}GB) and platform (macOS: {IS_MACOS})")
+    elif isinstance(max_workers, int):
+        # Manual override - validate the count
+        memory = psutil.virtual_memory()
+        available_gb = memory.available / (1024**3)
+        recommended_workers = get_optimal_worker_count(available_gb, IS_MACOS)
+        if max_workers > recommended_workers:
+            logger.warning(f"Manual override: Using {max_workers} workers. Recommended: {recommended_workers} for your system. Monitor for stability issues.")
     else:
         # Validate user-provided worker count
         memory = psutil.virtual_memory()
@@ -1060,7 +1072,7 @@ def remove_detected_intros(
         recommended_total = get_optimal_worker_count(available_gb, IS_MACOS)
         total_requested = match_workers + process_workers
         if total_requested > recommended_total:
-            logger.warning(f"Requested {total_requested} total workers exceeds recommended {recommended_total} for your system.")
+            logger.warning(f"Manual override: Using {total_requested} total workers. Recommended: {recommended_total} for your system. Monitor for stability issues.")
 
     logger.info(
         f"Using {match_workers} workers for matching and {process_workers} workers for processing"
